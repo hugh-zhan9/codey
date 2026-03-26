@@ -7316,6 +7316,35 @@ mod tests {
     }
 
     #[test]
+    fn slash_reload_parses_as_command() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        type_chars_humanlike(&mut composer, &['/', 'r', 'e', 'l', 'o', 'a', 'd']);
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        match result {
+            InputResult::Command(cmd) => {
+                assert_eq!(cmd.command(), "reload");
+            }
+            _ => panic!("expected Command for /reload"),
+        }
+    }
+
+    #[test]
     fn file_completion_preserves_large_paste_placeholder_elements() {
         use crossterm::event::KeyCode;
         use crossterm::event::KeyEvent;

@@ -17,6 +17,7 @@ use codex_app_server_client::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
 use codex_app_server_client::InProcessAppServerClient;
 use codex_app_server_client::InProcessClientStartArgs;
 use codex_app_server_client::InProcessServerEvent;
+use codex_app_server_protocol::ChatgptAuthTokensRefreshResponse;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::JSONRPCErrorError;
@@ -49,6 +50,7 @@ use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStartedNotification;
 use codex_arg0::Arg0DispatchPaths;
 use codex_cloud_requirements::cloud_requirements_loader_for_storage;
+use codex_core::AuthManager;
 use codex_core::LMSTUDIO_OSS_PROVIDER_ID;
 use codex_core::OLLAMA_OSS_PROVIDER_ID;
 use codex_core::auth::AuthConfig;
@@ -64,11 +66,12 @@ use codex_core::config_loader::ConfigLoadError;
 use codex_core::config_loader::LoaderOverrides;
 use codex_core::config_loader::format_config_error_with_source;
 use codex_core::format_exec_policy_error_with_source;
-use codex_core::path_utils;
 use codex_feedback::CodexFeedback;
 use codex_git_utils::get_git_repo_root;
+use codex_git_utils::paths_match_or_same_repo;
 use codex_otel::set_parent_from_context;
 use codex_otel::traceparent_context_from_env;
+use codex_protocol::account::PlanType as AccountPlanType;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ReviewRequest;
@@ -753,7 +756,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
 
         match server_event {
             InProcessServerEvent::ServerRequest(request) => {
-                handle_server_request(&client, request, &mut error_seen).await;
+                handle_server_request(&client, request, &config, &mut error_seen).await;
             }
             InProcessServerEvent::ServerNotification(mut notification) => {
                 if let ServerNotification::Error(payload) = &notification {
@@ -1129,13 +1132,7 @@ async fn parse_latest_turn_context_cwd(path: &Path) -> Option<PathBuf> {
 }
 
 fn cwds_match(current_cwd: &Path, session_cwd: &Path) -> bool {
-    match (
-        path_utils::normalize_for_path_comparison(current_cwd),
-        path_utils::normalize_for_path_comparison(session_cwd),
-    ) {
-        (Ok(current), Ok(session)) => current == session,
-        _ => current_cwd == session_cwd,
-    }
+    paths_match_or_same_repo(current_cwd, session_cwd)
 }
 
 async fn resolve_resume_thread_id(
@@ -1226,14 +1223,10 @@ async fn resolve_resume_thread_id(
 }
 
 fn resume_lookup_model_providers(
-    config: &Config,
-    args: &crate::cli::ResumeArgs,
+    _config: &Config,
+    _args: &crate::cli::ResumeArgs,
 ) -> Option<Vec<String>> {
-    if args.last {
-        Some(vec![config.model_provider_id.clone()])
-    } else {
-        None
-    }
+    None
 }
 
 fn canceled_mcp_server_elicitation_response() -> Result<Value, String> {
@@ -1307,6 +1300,7 @@ fn server_request_method_name(request: &ServerRequest) -> String {
 async fn handle_server_request(
     client: &InProcessAppServerClient,
     request: ServerRequest,
+    config: &Config,
     error_seen: &mut bool,
 ) {
     let method = server_request_method_name(&request);
@@ -1376,14 +1370,49 @@ async fn handle_server_request(
             )
             .await
         }
-        ServerRequest::ChatgptAuthTokensRefresh { request_id, .. } => {
-            reject_server_request(
-                client,
-                request_id,
-                &method,
-                "chatgpt auth token refresh is not supported in exec mode".to_string(),
-            )
-            .await
+        ServerRequest::ChatgptAuthTokensRefresh { request_id, params } => {
+            let refresh_result = tokio::task::spawn_blocking({
+                let config = config.clone();
+                move || local_external_chatgpt_tokens(&config)
+            })
+            .await;
+
+            match refresh_result {
+                Err(err) => {
+                    reject_server_request(
+                        client,
+                        request_id,
+                        &method,
+                        format!("local chatgpt auth refresh task failed in exec: {err}"),
+                    )
+                    .await
+                }
+                Ok(Err(reason)) => reject_server_request(client, request_id, &method, reason).await,
+                Ok(Ok(response)) => {
+                    if let Some(previous_account_id) = params.previous_account_id.as_deref()
+                        && previous_account_id != response.chatgpt_account_id
+                    {
+                        warn!(
+                            "local auth refresh account mismatch: expected `{previous_account_id}`, got `{}`",
+                            response.chatgpt_account_id
+                        );
+                    }
+                    match serde_json::to_value(response) {
+                        Ok(value) => {
+                            resolve_server_request(
+                                client,
+                                request_id,
+                                value,
+                                "account/chatgptAuthTokens/refresh",
+                            )
+                            .await
+                        }
+                        Err(err) => Err(format!(
+                            "failed to serialize chatgpt auth refresh response: {err}"
+                        )),
+                    }
+                }
+            }
         }
         ServerRequest::ApplyPatchApproval { request_id, params } => {
             reject_server_request(
@@ -1429,6 +1458,48 @@ async fn handle_server_request(
     }
 }
 
+fn local_external_chatgpt_tokens(
+    config: &Config,
+) -> Result<ChatgptAuthTokensRefreshResponse, String> {
+    let auth_manager = AuthManager::shared(
+        config.codex_home.clone(),
+        /*enable_codex_api_key_env*/ false,
+        config.cli_auth_credentials_store_mode,
+    );
+    auth_manager.set_forced_chatgpt_workspace_id(config.forced_chatgpt_workspace_id.clone());
+    auth_manager.reload();
+
+    let auth = auth_manager
+        .auth_cached()
+        .ok_or_else(|| "no cached auth available for local token refresh".to_string())?;
+    if !auth.is_external_chatgpt_tokens() {
+        return Err("external ChatGPT token auth is not active".to_string());
+    }
+
+    let access_token = auth
+        .get_token()
+        .map_err(|err| format!("failed to read external access token: {err}"))?;
+    let chatgpt_account_id = auth
+        .get_account_id()
+        .ok_or_else(|| "external token auth is missing chatgpt account id".to_string())?;
+    let chatgpt_plan_type = auth.account_plan_type().map(|plan_type| match plan_type {
+        AccountPlanType::Free => "free".to_string(),
+        AccountPlanType::Go => "go".to_string(),
+        AccountPlanType::Plus => "plus".to_string(),
+        AccountPlanType::Pro => "pro".to_string(),
+        AccountPlanType::Team => "team".to_string(),
+        AccountPlanType::Business => "business".to_string(),
+        AccountPlanType::Enterprise => "enterprise".to_string(),
+        AccountPlanType::Edu => "edu".to_string(),
+        AccountPlanType::Unknown => "unknown".to_string(),
+    });
+
+    Ok(ChatgptAuthTokensRefreshResponse {
+        access_token,
+        chatgpt_account_id,
+        chatgpt_plan_type,
+    })
+}
 fn load_output_schema(path: Option<PathBuf>) -> Option<Value> {
     let path = path?;
 
@@ -1601,6 +1672,7 @@ fn build_review_request(args: &ReviewArgs) -> anyhow::Result<ReviewRequest> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use codex_otel::set_parent_from_w3c_trace_context;
     use codex_protocol::config_types::ApprovalsReviewer;
     use opentelemetry::trace::TraceContextExt;
@@ -1787,7 +1859,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_lookup_model_providers_filters_only_last_lookup() {
+    async fn resume_lookup_model_providers_does_not_filter_by_provider() {
         let codex_home = tempdir().expect("create temp codex home");
         let cwd = tempdir().expect("create temp cwd");
         let mut config = ConfigBuilder::default()
@@ -1813,11 +1885,28 @@ mod tests {
             prompt: None,
         };
 
-        assert_eq!(
-            resume_lookup_model_providers(&config, &last_args),
-            Some(vec!["test-provider".to_string()])
-        );
+        assert_eq!(resume_lookup_model_providers(&config, &last_args), None);
         assert_eq!(resume_lookup_model_providers(&config, &named_args), None);
+    }
+
+    #[test]
+    fn cwds_match_returns_false_for_different_projects() {
+        let current_cwd = tempdir().expect("create current cwd");
+        let session_cwd = tempdir().expect("create session cwd");
+
+        assert_eq!(cwds_match(current_cwd.path(), session_cwd.path()), false);
+    }
+
+    #[test]
+    fn cwds_match_returns_true_for_same_git_project() {
+        let repo_root = tempdir().expect("create repo root");
+        std::fs::create_dir(repo_root.path().join(".git")).expect("create git dir");
+        let current_cwd = repo_root.path().join("apps/current");
+        let session_cwd = repo_root.path().join("packages/session");
+        std::fs::create_dir_all(&current_cwd).expect("create current cwd");
+        std::fs::create_dir_all(&session_cwd).expect("create session cwd");
+
+        assert_eq!(cwds_match(&current_cwd, &session_cwd), true);
     }
 
     #[test]

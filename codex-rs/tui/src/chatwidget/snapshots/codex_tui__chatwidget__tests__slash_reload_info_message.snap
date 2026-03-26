@@ -1,0 +1,6 @@
+---
+source: tui/src/chatwidget/tests.rs
+assertion_line: 2341
+expression: rendered
+---
+• Reloaded auth. Active credentials changed. 当前认证: api-key

@@ -4,6 +4,7 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::path_utils;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::future::join_all;
 use schemars::JsonSchema;
@@ -35,6 +36,29 @@ pub fn get_git_repo_root(base_dir: &Path) -> Option<PathBuf> {
         base_dir.parent()?
     };
     find_ancestor_git_entry(base).map(|(repo_root, _)| repo_root)
+}
+
+pub fn paths_match_or_same_repo(a: &Path, b: &Path) -> bool {
+    if let (Ok(ca), Ok(cb)) = (
+        path_utils::normalize_for_path_comparison(a),
+        path_utils::normalize_for_path_comparison(b),
+    ) && ca == cb
+    {
+        return true;
+    }
+
+    let (Some(repo_a), Some(repo_b)) = (get_git_repo_root(a), get_git_repo_root(b)) else {
+        return a == b;
+    };
+
+    if let (Ok(ca), Ok(cb)) = (
+        path_utils::normalize_for_path_comparison(&repo_a),
+        path_utils::normalize_for_path_comparison(&repo_b),
+    ) {
+        return ca == cb;
+    }
+
+    repo_a == repo_b
 }
 
 /// Timeout for git commands to prevent freezing on large repositories

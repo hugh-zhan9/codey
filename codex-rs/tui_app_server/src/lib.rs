@@ -36,6 +36,7 @@ use codex_core::config_loader::LoaderOverrides;
 use codex_core::config_loader::format_config_error_with_source;
 use codex_core::default_client::set_default_client_residency_requirement;
 use codex_core::format_exec_policy_error_with_source;
+use codex_core::git_info::paths_match_or_same_repo;
 use codex_core::path_utils;
 use codex_core::read_session_meta_line;
 use codex_core::state_db::get_state_db;
@@ -576,40 +577,51 @@ async fn lookup_latest_session_target_with_app_server(
     config: &Config,
     cwd_filter: Option<&Path>,
 ) -> color_eyre::Result<Option<resume_picker::SessionTarget>> {
-    let response = app_server
-        .thread_list(latest_session_lookup_params(
-            app_server.is_remote(),
-            config,
-            cwd_filter,
-        ))
-        .await?;
-    Ok(response
-        .data
-        .into_iter()
-        .find_map(session_target_from_app_server_thread))
+    let is_remote = app_server.is_remote();
+    let mut cursor = None;
+
+    loop {
+        let response = app_server
+            .thread_list(latest_session_lookup_params(
+                is_remote,
+                config,
+                cwd_filter,
+                cursor.take(),
+            ))
+            .await?;
+
+        if let Some(target_session) = response.data.into_iter().find_map(|thread| {
+            if let Some(cwd_filter) = cwd_filter
+                && !paths_match_or_same_repo(thread.cwd.as_path(), cwd_filter)
+            {
+                return None;
+            }
+            session_target_from_app_server_thread(thread)
+        }) {
+            return Ok(Some(target_session));
+        }
+
+        cursor = response.next_cursor;
+        if cursor.is_none() {
+            return Ok(None);
+        }
+    }
 }
 
 fn latest_session_lookup_params(
-    is_remote: bool,
-    config: &Config,
-    cwd_filter: Option<&Path>,
+    _is_remote: bool,
+    _config: &Config,
+    _cwd_filter: Option<&Path>,
+    cursor: Option<String>,
 ) -> ThreadListParams {
     ThreadListParams {
-        cursor: None,
-        limit: Some(1),
+        cursor,
+        limit: Some(25),
         sort_key: Some(AppServerThreadSortKey::UpdatedAt),
-        model_providers: if is_remote {
-            None
-        } else {
-            Some(vec![config.model_provider_id.clone()])
-        },
+        model_providers: None,
         source_kinds: Some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]),
         archived: Some(false),
-        cwd: if is_remote {
-            None
-        } else {
-            cwd_filter.map(|cwd| cwd.to_string_lossy().to_string())
-        },
+        cwd: None,
         search_term: None,
     }
 }
@@ -1791,16 +1803,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn latest_session_lookup_params_keep_local_filters_for_embedded_sessions()
+    async fn latest_session_lookup_params_do_not_apply_provider_or_cwd_filters_for_embedded_sessions()
     -> std::io::Result<()> {
         let temp_dir = TempDir::new()?;
         let config = build_config(&temp_dir).await?;
         let cwd = temp_dir.path().join("project");
 
-        let params = latest_session_lookup_params(false, &config, Some(cwd.as_path()));
+        let params = latest_session_lookup_params(false, &config, Some(cwd.as_path()), None);
 
-        assert_eq!(params.model_providers, Some(vec![config.model_provider_id]));
-        assert_eq!(params.cwd, Some(cwd.to_string_lossy().to_string()));
+        assert_eq!(params.model_providers, None);
+        assert_eq!(params.cwd, None);
         Ok(())
     }
 
@@ -1811,7 +1823,7 @@ mod tests {
         let config = build_config(&temp_dir).await?;
         let cwd = temp_dir.path().join("project");
 
-        let params = latest_session_lookup_params(true, &config, Some(cwd.as_path()));
+        let params = latest_session_lookup_params(true, &config, Some(cwd.as_path()), None);
 
         assert_eq!(params.model_providers, None);
         assert_eq!(params.cwd, None);

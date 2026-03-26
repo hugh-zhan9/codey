@@ -58,6 +58,7 @@ use crate::terminal_title::set_terminal_title;
 use crate::text_formatting::proper_join;
 use crate::version::CODEX_CLI_VERSION;
 use codex_app_server_protocol::AppSummary;
+use codex_app_server_protocol::AuthMode as ApiAuthMode;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_backend_client::Client as BackendClient;
 use codex_chatgpt::connectors;
@@ -4713,6 +4714,54 @@ impl ChatWidget {
                 }
                 self.request_quit_without_confirmation();
             }
+            SlashCommand::Reload => {
+                let auth_fingerprint = |auth: Option<&CodexAuth>| {
+                    auth.map(|auth| {
+                        (
+                            auth.api_auth_mode(),
+                            auth.get_account_id(),
+                            auth.account_plan_type(),
+                            auth.get_token().ok(),
+                        )
+                    })
+                };
+                let auth_hint = |auth: Option<&CodexAuth>| {
+                    auth.map(|auth| {
+                        let mode = match auth.api_auth_mode() {
+                            ApiAuthMode::ApiKey => "api-key",
+                            ApiAuthMode::Chatgpt => "chatgpt",
+                            ApiAuthMode::ChatgptAuthTokens => "chatgpt-external",
+                        };
+                        match auth.get_account_id() {
+                            Some(account_id) => format!("当前认证: {mode} ({account_id})"),
+                            None => format!("当前认证: {mode}"),
+                        }
+                    })
+                };
+
+                let before_auth = self.auth_manager.auth_cached();
+                let before_fingerprint = auth_fingerprint(before_auth.as_ref());
+                let reloaded = self.auth_manager.reload();
+                let after_auth = self.auth_manager.auth_cached();
+                let auth_changed = before_fingerprint != auth_fingerprint(after_auth.as_ref());
+
+                self.rate_limit_snapshots_by_limit_id.clear();
+                self.plan_type = None;
+                self.rate_limit_warnings = RateLimitWarningState::default();
+                self.rate_limit_switch_prompt = RateLimitSwitchPromptState::default();
+                self.refresh_status_surfaces();
+                self.prefetch_rate_limits();
+
+                let message = match (after_auth.as_ref(), auth_changed, reloaded) {
+                    (Some(_), true, _) => "Reloaded auth. Active credentials changed.",
+                    (Some(_), false, true) => {
+                        "Reloaded auth. Credentials were reloaded without changing the active identity."
+                    }
+                    (Some(_), false, false) => "Reloaded auth. No credential changes detected.",
+                    (None, _, _) => "Reloaded auth. No active credentials are configured.",
+                };
+                self.add_info_message(message.to_string(), auth_hint(after_auth.as_ref()));
+            }
             // SlashCommand::Undo => {
             //     self.app_event_tx.send(AppEvent::CodexOp(Op::Undo));
             // }
@@ -4903,6 +4952,9 @@ impl ChatWidget {
                         self.add_error_message("Usage: /fast [on|off|status]".to_string());
                     }
                 }
+            }
+            SlashCommand::Reload => {
+                self.add_error_message("Usage: /reload".to_string());
             }
             SlashCommand::Rename if !trimmed.is_empty() => {
                 self.session_telemetry

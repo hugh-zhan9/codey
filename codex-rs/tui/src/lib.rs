@@ -840,7 +840,6 @@ async fn run_ratatui_app(
             None => return missing_session_exit(id_str, "resume"),
         }
     } else if cli.resume_last {
-        let provider_filter = vec![config.model_provider_id.clone()];
         let filter_cwd = if cli.resume_show_all {
             None
         } else {
@@ -857,7 +856,7 @@ async fn run_ratatui_app(
             /*cursor*/ None,
             ThreadSortKey::UpdatedAt,
             allowed_sources,
-            Some(provider_filter.as_slice()),
+            None,
             &config.model_provider_id,
             filter_cwd,
         )

@@ -45,6 +45,7 @@ pub enum SlashCommand {
     Apps,
     Plugins,
     Logout,
+    Reload,
     Quit,
     Exit,
     Feedback,
@@ -113,6 +114,7 @@ impl SlashCommand {
             SlashCommand::Apps => "manage apps",
             SlashCommand::Plugins => "browse plugins",
             SlashCommand::Logout => "log out of Codex",
+            SlashCommand::Reload => "reload auth state from disk or keyring",
             SlashCommand::Rollout => "print the rollout file path",
             SlashCommand::TestApproval => "test approval request",
         }
@@ -132,6 +134,7 @@ impl SlashCommand {
                 | SlashCommand::Rename
                 | SlashCommand::Plan
                 | SlashCommand::Fast
+                | SlashCommand::Reload
                 | SlashCommand::SandboxReadRoot
         )
     }
@@ -157,6 +160,7 @@ impl SlashCommand {
             | SlashCommand::Plan
             | SlashCommand::Clear
             | SlashCommand::Logout
+            | SlashCommand::Reload
             | SlashCommand::MemoryDrop
             | SlashCommand::MemoryUpdate => false,
             SlashCommand::Diff

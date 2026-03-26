@@ -33,6 +33,7 @@ use codex_app_server_protocol::PluginSource;
 use codex_app_server_protocol::PluginSummary;
 use codex_app_server_protocol::SkillSummary;
 use codex_core::CodexAuth;
+use codex_core::auth::AuthCredentialsStoreMode;
 use codex_core::config::ApprovalsReviewer;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
@@ -2446,6 +2447,82 @@ async fn rate_limit_snapshot_updates_and_retains_plan_type() {
         plan_type: None,
     }));
     assert_eq!(chat.plan_type, Some(PlanType::Pro));
+}
+
+#[tokio::test]
+async fn reload_command_reloads_cached_auth_and_clears_rate_limits() {
+    let auth_home = tempdir().expect("tempdir");
+    codex_core::auth::login_with_api_key(
+        auth_home.path(),
+        "old-key",
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("write initial auth");
+
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.config.codex_home = auth_home.path().to_path_buf();
+    chat.config.cli_auth_credentials_store_mode = AuthCredentialsStoreMode::File;
+    chat.auth_manager = codex_core::AuthManager::shared(
+        chat.config.codex_home.clone(),
+        /*enable_codex_api_key_env*/ false,
+        chat.config.cli_auth_credentials_store_mode,
+    );
+    chat.rate_limit_snapshots_by_limit_id.insert(
+        "codex".to_string(),
+        crate::status::rate_limit_snapshot_display(
+            &RateLimitSnapshot {
+                limit_id: None,
+                limit_name: None,
+                primary: Some(RateLimitWindow {
+                    used_percent: 80.0,
+                    window_minutes: Some(60),
+                    resets_at: None,
+                }),
+                secondary: None,
+                credits: None,
+                plan_type: Some(PlanType::Plus),
+            },
+            chrono::Local::now(),
+        ),
+    );
+    chat.plan_type = Some(PlanType::Plus);
+
+    assert_eq!(
+        chat.auth_manager
+            .auth_cached()
+            .as_ref()
+            .and_then(CodexAuth::api_key),
+        Some("old-key")
+    );
+
+    codex_core::auth::login_with_api_key(
+        auth_home.path(),
+        "new-key",
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("overwrite auth");
+
+    chat.bottom_pane
+        .set_composer_text("/reload".to_string(), Vec::new(), Vec::new());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(
+        chat.auth_manager
+            .auth_cached()
+            .as_ref()
+            .and_then(CodexAuth::api_key),
+        Some("new-key")
+    );
+    assert!(chat.rate_limit_snapshots_by_limit_id.is_empty());
+    assert_eq!(chat.plan_type, None);
+    assert_no_submit_op(&mut op_rx);
+
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("");
+    assert_snapshot!("slash_reload_info_message", rendered);
 }
 
 #[tokio::test]

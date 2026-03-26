@@ -45,6 +45,7 @@ use crate::default_client::originator;
 use crate::state_db;
 use crate::state_db::StateDbHandle;
 use codex_git_utils::collect_git_info;
+use codex_git_utils::paths_match_or_same_repo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GitInfo as ProtocolGitInfo;
 use codex_protocol::protocol::InitialHistory;
@@ -1097,13 +1098,7 @@ async fn select_resume_path_from_db_page(
 }
 
 fn cwd_matches(session_cwd: &Path, cwd: &Path) -> bool {
-    if let (Ok(ca), Ok(cb)) = (
-        path_utils::normalize_for_path_comparison(session_cwd),
-        path_utils::normalize_for_path_comparison(cwd),
-    ) {
-        return ca == cb;
-    }
-    session_cwd == cwd
+    paths_match_or_same_repo(session_cwd, cwd)
 }
 
 #[cfg(test)]

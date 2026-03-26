@@ -20,7 +20,7 @@ use codex_core::ThreadSortKey;
 use codex_core::ThreadsPage;
 use codex_core::config::Config;
 use codex_core::find_thread_names_by_ids;
-use codex_core::path_utils;
+use codex_core::git_info::paths_match_or_same_repo;
 use codex_protocol::ThreadId;
 use color_eyre::eyre::Result;
 use crossterm::event::KeyCode;
@@ -131,9 +131,8 @@ enum BackgroundEvent {
 /// new sessions appear during pagination.
 ///
 /// Filtering happens in two layers:
-/// 1. Provider and source filtering at the backend (interactive sessions for the
-///    current model provider by default, optionally including non-interactive
-///    sessions).
+/// 1. Source filtering at the backend (interactive sessions by default,
+///    optionally including non-interactive sessions).
 /// 2. Working-directory filtering at the picker (unless `--all` is passed).
 pub async fn run_resume_picker(
     tui: &mut Tui,
@@ -178,11 +177,8 @@ async fn run_session_picker(
 
     let default_provider = config.model_provider_id.to_string();
     let codex_home = config.codex_home.as_path();
-    let filter_cwd = if show_all {
-        None
-    } else {
-        std::env::current_dir().ok()
-    };
+    let current_cwd = std::env::current_dir().ok();
+    let filter_cwd = if show_all { None } else { current_cwd.clone() };
 
     let config = config.clone();
     let loader_tx = bg_tx.clone();
@@ -191,14 +187,13 @@ async fn run_session_picker(
         let tx = loader_tx.clone();
         let config = config.clone();
         tokio::spawn(async move {
-            let provider_filter = vec![request.default_provider.clone()];
             let page = RolloutRecorder::list_threads(
                 &config,
                 PAGE_SIZE,
                 request.cursor.as_ref(),
                 request.sort_key,
                 allowed_sources,
-                Some(provider_filter.as_slice()),
+                None,
                 request.default_provider.as_str(),
                 /*search_term*/ None,
             )
@@ -220,6 +215,7 @@ async fn run_session_picker(
         filter_cwd,
         action,
     );
+    state.current_cwd = current_cwd;
     state.start_initial_load();
     state.request_frame();
 
@@ -288,6 +284,7 @@ impl Drop for AltScreenGuard<'_> {
 
 struct PickerState {
     codex_home: PathBuf,
+    current_cwd: Option<PathBuf>,
     requester: FrameRequester,
     pagination: PaginationState,
     all_rows: Vec<Row>,
@@ -340,6 +337,17 @@ enum LoadTrigger {
     Search { token: usize },
 }
 
+enum DisplayRow<'a> {
+    GroupHeader(GroupHeader<'a>),
+    Session { row_index: usize, row: &'a Row },
+}
+
+struct GroupHeader<'a> {
+    cwd: Option<&'a Path>,
+    count: usize,
+    is_current: bool,
+}
+
 impl LoadingState {
     fn is_pending(&self) -> bool {
         matches!(self, LoadingState::Pending(_))
@@ -390,6 +398,113 @@ impl Row {
 }
 
 impl PickerState {
+    fn group_sort_key(&self, cwd: Option<&Path>, first_index: usize) -> (bool, usize) {
+        let is_current = match (self.current_cwd.as_deref(), cwd) {
+            (Some(current_cwd), Some(group_cwd)) => paths_match(group_cwd, current_cwd),
+            _ => false,
+        };
+        (!is_current, first_index)
+    }
+
+    fn group_rows(&self, rows: Vec<Row>) -> Vec<Row> {
+        struct Group {
+            cwd: Option<PathBuf>,
+            first_index: usize,
+            rows: Vec<Row>,
+        }
+
+        let mut groups: Vec<Group> = Vec::new();
+        for (index, row) in rows.into_iter().enumerate() {
+            let cwd = row.cwd.clone();
+            if let Some(group) = groups.iter_mut().find(|group| group.cwd == cwd) {
+                group.rows.push(row);
+            } else {
+                groups.push(Group {
+                    cwd,
+                    first_index: index,
+                    rows: vec![row],
+                });
+            }
+        }
+
+        groups.sort_by_key(|group| self.group_sort_key(group.cwd.as_deref(), group.first_index));
+
+        groups.into_iter().flat_map(|group| group.rows).collect()
+    }
+
+    fn display_rows(&self) -> Vec<DisplayRow<'_>> {
+        let mut display_rows = Vec::new();
+        let mut group_start = 0usize;
+
+        while group_start < self.filtered_rows.len() {
+            let group_cwd = self.filtered_rows[group_start].cwd.as_deref();
+            let mut group_end = group_start + 1;
+            while group_end < self.filtered_rows.len()
+                && self.filtered_rows[group_end].cwd.as_deref() == group_cwd
+            {
+                group_end += 1;
+            }
+
+            display_rows.push(DisplayRow::GroupHeader(GroupHeader {
+                cwd: group_cwd,
+                count: group_end - group_start,
+                is_current: matches!(
+                    (self.current_cwd.as_deref(), group_cwd),
+                    (Some(current_cwd), Some(group_cwd)) if paths_match(group_cwd, current_cwd)
+                ),
+            }));
+
+            for row_index in group_start..group_end {
+                display_rows.push(DisplayRow::Session {
+                    row_index,
+                    row: &self.filtered_rows[row_index],
+                });
+            }
+
+            group_start = group_end;
+        }
+
+        display_rows
+    }
+
+    fn display_row_count(&self) -> usize {
+        self.filtered_rows.len()
+            + self
+                .filtered_rows
+                .iter()
+                .fold((None::<&Path>, 0usize), |(prev, count), row| {
+                    let cwd = row.cwd.as_deref();
+                    if prev == cwd {
+                        (cwd, count)
+                    } else {
+                        (cwd, count + 1)
+                    }
+                })
+                .1
+    }
+
+    fn selected_display_index(&self) -> Option<usize> {
+        if self.filtered_rows.is_empty() {
+            return None;
+        }
+
+        let headers_before_selected = self
+            .filtered_rows
+            .iter()
+            .take(self.selected + 1)
+            .fold((None::<&Path>, 0usize), |(prev, count), row| {
+                let cwd = row.cwd.as_deref();
+                if prev == cwd {
+                    (cwd, count)
+                } else {
+                    (cwd, count + 1)
+                }
+            })
+            .1;
+
+        Some(self.selected + headers_before_selected)
+    }
+
     fn new(
         codex_home: PathBuf,
         requester: FrameRequester,
@@ -401,6 +516,7 @@ impl PickerState {
     ) -> Self {
         Self {
             codex_home,
+            current_cwd: None,
             requester,
             pagination: PaginationState {
                 next_cursor: None,
@@ -662,10 +778,11 @@ impl PickerState {
             .iter()
             .filter(|row| self.row_matches_filter(row));
         if self.query.is_empty() {
-            self.filtered_rows = base_iter.cloned().collect();
+            self.filtered_rows = self.group_rows(base_iter.cloned().collect());
         } else {
             let q = self.query.to_lowercase();
-            self.filtered_rows = base_iter.filter(|r| r.matches_query(&q)).cloned().collect();
+            self.filtered_rows =
+                self.group_rows(base_iter.filter(|r| r.matches_query(&q)).cloned().collect());
         }
         if self.selected >= self.filtered_rows.len() {
             self.selected = self.filtered_rows.len().saturating_sub(1);
@@ -687,7 +804,7 @@ impl PickerState {
         let Some(row_cwd) = row.cwd.as_ref() else {
             return false;
         };
-        paths_match(row_cwd, filter_cwd)
+        paths_match_or_same_repo(row_cwd, filter_cwd)
     }
 
     fn set_query(&mut self, new_query: String) {
@@ -746,18 +863,22 @@ impl PickerState {
             self.scroll_top = 0;
             return;
         }
-        let capacity = self.view_rows.unwrap_or(self.filtered_rows.len()).max(1);
+        let capacity = self.view_rows.unwrap_or(self.display_row_count()).max(1);
+        let Some(selected_display_index) = self.selected_display_index() else {
+            self.scroll_top = 0;
+            return;
+        };
 
-        if self.selected < self.scroll_top {
-            self.scroll_top = self.selected;
+        if selected_display_index < self.scroll_top {
+            self.scroll_top = selected_display_index;
         } else {
             let last_visible = self.scroll_top.saturating_add(capacity - 1);
-            if self.selected > last_visible {
-                self.scroll_top = self.selected.saturating_sub(capacity - 1);
+            if selected_display_index > last_visible {
+                self.scroll_top = selected_display_index.saturating_sub(capacity - 1);
             }
         }
 
-        let max_start = self.filtered_rows.len().saturating_sub(capacity);
+        let max_start = self.display_row_count().saturating_sub(capacity);
         if self.scroll_top > max_start {
             self.scroll_top = max_start;
         }
@@ -767,7 +888,7 @@ impl PickerState {
         if minimum_rows == 0 {
             return;
         }
-        if self.filtered_rows.len() >= minimum_rows {
+        if self.display_row_count() >= minimum_rows {
             return;
         }
         if self.pagination.loading.is_pending() || self.pagination.next_cursor.is_none() {
@@ -887,13 +1008,7 @@ fn head_to_row(item: &ThreadItem) -> Row {
 }
 
 fn paths_match(a: &Path, b: &Path) -> bool {
-    if let (Ok(ca), Ok(cb)) = (
-        path_utils::normalize_for_path_comparison(a),
-        path_utils::normalize_for_path_comparison(b),
-    ) {
-        return ca == cb;
-    }
-    a == b
+    paths_match_or_same_repo(a, b)
 }
 
 fn parse_timestamp_str(ts: &str) -> Option<DateTime<Utc>> {
@@ -988,9 +1103,10 @@ fn render_list(
         return;
     }
 
+    let display_rows = state.display_rows();
     let capacity = area.height as usize;
-    let start = state.scroll_top.min(rows.len().saturating_sub(1));
-    let end = rows.len().min(start + capacity);
+    let start = state.scroll_top.min(display_rows.len().saturating_sub(1));
+    let end = display_rows.len().min(start + capacity);
     let labels = &metrics.labels;
     let mut y = area.y;
 
@@ -1000,101 +1116,108 @@ fn render_list(
     let max_branch_width = metrics.max_branch_width;
     let max_cwd_width = metrics.max_cwd_width;
 
-    for (idx, (row, (created_label, updated_label, branch_label, cwd_label))) in rows[start..end]
-        .iter()
-        .zip(labels[start..end].iter())
-        .enumerate()
-    {
-        let is_sel = start + idx == state.selected;
-        let marker = if is_sel { "> ".bold() } else { "  ".into() };
-        let marker_width = 2usize;
-        let created_span = if visibility.show_created {
-            Some(Span::from(format!("{created_label:<max_created_width$}")).dim())
-        } else {
-            None
-        };
-        let updated_span = if visibility.show_updated {
-            Some(Span::from(format!("{updated_label:<max_updated_width$}")).dim())
-        } else {
-            None
-        };
-        let branch_span = if !visibility.show_branch {
-            None
-        } else if branch_label.is_empty() {
-            Some(
-                Span::from(format!(
-                    "{empty:<width$}",
-                    empty = "-",
-                    width = max_branch_width
-                ))
-                .dim(),
-            )
-        } else {
-            Some(Span::from(format!("{branch_label:<max_branch_width$}")).cyan())
-        };
-        let cwd_span = if !visibility.show_cwd {
-            None
-        } else if cwd_label.is_empty() {
-            Some(
-                Span::from(format!(
-                    "{empty:<width$}",
-                    empty = "-",
-                    width = max_cwd_width
-                ))
-                .dim(),
-            )
-        } else {
-            Some(Span::from(format!("{cwd_label:<max_cwd_width$}")).dim())
-        };
-
-        let mut preview_width = area.width as usize;
-        preview_width = preview_width.saturating_sub(marker_width);
-        if visibility.show_created {
-            preview_width = preview_width.saturating_sub(max_created_width + 2);
-        }
-        if visibility.show_updated {
-            preview_width = preview_width.saturating_sub(max_updated_width + 2);
-        }
-        if visibility.show_branch {
-            preview_width = preview_width.saturating_sub(max_branch_width + 2);
-        }
-        if visibility.show_cwd {
-            preview_width = preview_width.saturating_sub(max_cwd_width + 2);
-        }
-        let add_leading_gap = !visibility.show_created
-            && !visibility.show_updated
-            && !visibility.show_branch
-            && !visibility.show_cwd;
-        if add_leading_gap {
-            preview_width = preview_width.saturating_sub(2);
-        }
-        let preview = truncate_text(row.display_preview(), preview_width);
-        let mut spans: Vec<Span> = vec![marker];
-        if let Some(created) = created_span {
-            spans.push(created);
-            spans.push("  ".into());
-        }
-        if let Some(updated) = updated_span {
-            spans.push(updated);
-            spans.push("  ".into());
-        }
-        if let Some(branch) = branch_span {
-            spans.push(branch);
-            spans.push("  ".into());
-        }
-        if let Some(cwd) = cwd_span {
-            spans.push(cwd);
-            spans.push("  ".into());
-        }
-        if add_leading_gap {
-            spans.push("  ".into());
-        }
-        spans.push(preview.into());
-
-        let line: Line = spans.into();
+    for display_row in &display_rows[start..end] {
         let rect = Rect::new(area.x, y, area.width, 1);
-        frame.render_widget_ref(line, rect);
-        y = y.saturating_add(1);
+        match display_row {
+            DisplayRow::GroupHeader(group) => {
+                let line = render_group_header_line(group, area.width);
+                frame.render_widget_ref(line, rect);
+                y = y.saturating_add(1);
+                continue;
+            }
+            DisplayRow::Session { row_index, row } => {
+                let (created_label, updated_label, branch_label, cwd_label) = &labels[*row_index];
+                let is_sel = *row_index == state.selected;
+                let marker = if is_sel { "> ".bold() } else { "  ".into() };
+                let marker_width = 2usize;
+                let created_span = if visibility.show_created {
+                    Some(Span::from(format!("{created_label:<max_created_width$}")).dim())
+                } else {
+                    None
+                };
+                let updated_span = if visibility.show_updated {
+                    Some(Span::from(format!("{updated_label:<max_updated_width$}")).dim())
+                } else {
+                    None
+                };
+                let branch_span = if !visibility.show_branch {
+                    None
+                } else if branch_label.is_empty() {
+                    Some(
+                        Span::from(format!(
+                            "{empty:<width$}",
+                            empty = "-",
+                            width = max_branch_width
+                        ))
+                        .dim(),
+                    )
+                } else {
+                    Some(Span::from(format!("{branch_label:<max_branch_width$}")).cyan())
+                };
+                let cwd_span = if !visibility.show_cwd {
+                    None
+                } else if cwd_label.is_empty() {
+                    Some(
+                        Span::from(format!(
+                            "{empty:<width$}",
+                            empty = "-",
+                            width = max_cwd_width
+                        ))
+                        .dim(),
+                    )
+                } else {
+                    Some(Span::from(format!("{cwd_label:<max_cwd_width$}")).dim())
+                };
+
+                let mut preview_width = area.width as usize;
+                preview_width = preview_width.saturating_sub(marker_width);
+                if visibility.show_created {
+                    preview_width = preview_width.saturating_sub(max_created_width + 2);
+                }
+                if visibility.show_updated {
+                    preview_width = preview_width.saturating_sub(max_updated_width + 2);
+                }
+                if visibility.show_branch {
+                    preview_width = preview_width.saturating_sub(max_branch_width + 2);
+                }
+                if visibility.show_cwd {
+                    preview_width = preview_width.saturating_sub(max_cwd_width + 2);
+                }
+                let add_leading_gap = !visibility.show_created
+                    && !visibility.show_updated
+                    && !visibility.show_branch
+                    && !visibility.show_cwd;
+                if add_leading_gap {
+                    preview_width = preview_width.saturating_sub(2);
+                }
+                let preview = truncate_text(row.display_preview(), preview_width);
+                let mut spans: Vec<Span> = vec![marker];
+                if let Some(created) = created_span {
+                    spans.push(created);
+                    spans.push("  ".into());
+                }
+                if let Some(updated) = updated_span {
+                    spans.push(updated);
+                    spans.push("  ".into());
+                }
+                if let Some(branch) = branch_span {
+                    spans.push(branch);
+                    spans.push("  ".into());
+                }
+                if let Some(cwd) = cwd_span {
+                    spans.push(cwd);
+                    spans.push("  ".into());
+                }
+                if add_leading_gap {
+                    spans.push("  ".into());
+                }
+                spans.push(preview.into());
+
+                let line: Line = spans.into();
+                frame.render_widget_ref(line, rect);
+                y = y.saturating_add(1);
+            }
+        }
     }
 
     if state.pagination.loading.is_pending() && y < area.y.saturating_add(area.height) {
@@ -1102,6 +1225,35 @@ fn render_list(
         let rect = Rect::new(area.x, y, area.width, 1);
         frame.render_widget_ref(loading_line, rect);
     }
+}
+
+fn render_group_header_line(group: &GroupHeader<'_>, width: u16) -> Line<'static> {
+    let session_label = if group.count == 1 {
+        "1 session".to_string()
+    } else {
+        format!("{} sessions", group.count)
+    };
+
+    let text = match group.cwd {
+        Some(cwd) => {
+            let project_name = cwd
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Project");
+            let current_prefix = if group.is_current {
+                "Current project: "
+            } else {
+                "Project: "
+            };
+            format!(
+                "{current_prefix}{project_name}  {}  {session_label}",
+                cwd.display()
+            )
+        }
+        None => format!("No project  {session_label}"),
+    };
+
+    Line::from(truncate_text(&text, width as usize).bold())
 }
 
 fn render_empty_state_line(state: &PickerState) -> Line<'static> {
@@ -2401,5 +2553,166 @@ mod tests {
         assert!(state.filtered_rows.is_empty());
         assert!(!state.search_state.is_active());
         assert!(state.pagination.reached_scan_cap);
+    }
+
+    #[test]
+    fn local_picker_filters_rows_to_current_project_by_default() {
+        let loader: PageLoader = Arc::new(|_| {});
+        let state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            String::from("openai"),
+            false,
+            Some(PathBuf::from("/workspace/current")),
+            SessionPickerAction::Resume,
+        );
+        let row = Row {
+            path: PathBuf::from("/tmp/a.jsonl"),
+            preview: String::from("other project session"),
+            thread_id: Some(ThreadId::new()),
+            thread_name: None,
+            created_at: None,
+            updated_at: None,
+            cwd: Some(PathBuf::from("/another/project")),
+            git_branch: None,
+        };
+
+        assert!(!state.row_matches_filter(&row));
+    }
+
+    #[test]
+    fn local_picker_show_all_includes_rows_from_other_projects() {
+        let loader: PageLoader = Arc::new(|_| {});
+        let state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            String::from("openai"),
+            true,
+            Some(PathBuf::from("/workspace/current")),
+            SessionPickerAction::Resume,
+        );
+        let row = Row {
+            path: PathBuf::from("/tmp/a.jsonl"),
+            preview: String::from("other project session"),
+            thread_id: Some(ThreadId::new()),
+            thread_name: None,
+            created_at: None,
+            updated_at: None,
+            cwd: Some(PathBuf::from("/another/project")),
+            git_branch: None,
+        };
+
+        assert!(state.row_matches_filter(&row));
+    }
+
+    #[test]
+    fn local_picker_matches_rows_in_same_git_project() {
+        let repo_root = tempfile::tempdir().expect("create repo root");
+        std::fs::create_dir(repo_root.path().join(".git")).expect("create git dir");
+        let current_cwd = repo_root.path().join("apps/current");
+        let row_cwd = repo_root.path().join("packages/session");
+        std::fs::create_dir_all(&current_cwd).expect("create current cwd");
+        std::fs::create_dir_all(&row_cwd).expect("create row cwd");
+
+        let loader: PageLoader = Arc::new(|_| {});
+        let state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            String::from("openai"),
+            false,
+            Some(current_cwd),
+            SessionPickerAction::Resume,
+        );
+        let row = Row {
+            path: PathBuf::from("/tmp/a.jsonl"),
+            preview: String::from("same project session"),
+            thread_id: Some(ThreadId::new()),
+            thread_name: None,
+            created_at: None,
+            updated_at: None,
+            cwd: Some(row_cwd),
+            git_branch: None,
+        };
+
+        assert!(state.row_matches_filter(&row));
+    }
+
+    #[test]
+    fn apply_filter_groups_rows_by_project_and_prioritizes_current_project() {
+        let loader: PageLoader = Arc::new(|_| {});
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            String::from("openai"),
+            false,
+            None,
+            SessionPickerAction::Resume,
+        );
+        state.current_cwd = Some(PathBuf::from("/workspace/current"));
+        state.all_rows = vec![
+            Row {
+                path: PathBuf::from("/tmp/a.jsonl"),
+                preview: String::from("current-1"),
+                thread_id: Some(ThreadId::new()),
+                thread_name: None,
+                created_at: None,
+                updated_at: None,
+                cwd: Some(PathBuf::from("/workspace/current")),
+                git_branch: None,
+            },
+            Row {
+                path: PathBuf::from("/tmp/b.jsonl"),
+                preview: String::from("other-1"),
+                thread_id: Some(ThreadId::new()),
+                thread_name: None,
+                created_at: None,
+                updated_at: None,
+                cwd: Some(PathBuf::from("/workspace/other")),
+                git_branch: None,
+            },
+            Row {
+                path: PathBuf::from("/tmp/c.jsonl"),
+                preview: String::from("current-2"),
+                thread_id: Some(ThreadId::new()),
+                thread_name: None,
+                created_at: None,
+                updated_at: None,
+                cwd: Some(PathBuf::from("/workspace/current")),
+                git_branch: None,
+            },
+            Row {
+                path: PathBuf::from("/tmp/d.jsonl"),
+                preview: String::from("no-project"),
+                thread_id: Some(ThreadId::new()),
+                thread_name: None,
+                created_at: None,
+                updated_at: None,
+                cwd: None,
+                git_branch: None,
+            },
+        ];
+
+        state.apply_filter();
+
+        let ordered_cwds: Vec<Option<&Path>> = state
+            .filtered_rows
+            .iter()
+            .map(|row| row.cwd.as_deref())
+            .collect();
+        assert_eq!(
+            ordered_cwds,
+            vec![
+                Some(Path::new("/workspace/current")),
+                Some(Path::new("/workspace/current")),
+                Some(Path::new("/workspace/other")),
+                None,
+            ]
+        );
+        assert_eq!(state.display_row_count(), 7);
+        assert_eq!(state.selected_display_index(), Some(1));
     }
 }
