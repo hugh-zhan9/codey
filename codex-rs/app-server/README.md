@@ -25,6 +25,7 @@ Supported transports:
 
 - stdio (`--listen stdio://`, default): newline-delimited JSON (JSONL)
 - websocket (`--listen ws://IP:PORT`): one JSON-RPC message per websocket text frame (**experimental / unsupported**)
+- off (`--listen off`): do not expose a local transport
 
 When running with `--listen ws://IP:PORT`, the same listener also serves basic HTTP health probes:
 
@@ -132,9 +133,9 @@ Example with notification opt-out:
 
 ## API Overview
 
-- `thread/start` — create a new thread; emits `thread/started` (including the current `thread.status`) and auto-subscribes you to turn/item events for that thread.
+- `thread/start` — create a new thread; emits `thread/started` (including the current `thread.status`) and auto-subscribes you to turn/item events for that thread. When the request includes a `cwd` and the resolved sandbox is `workspace-write` or full access, app-server also marks that project as trusted in the user `config.toml`.
 - `thread/resume` — reopen an existing thread by id so subsequent `turn/start` calls append to it.
-- `thread/fork` — fork an existing thread into a new thread id by copying the stored history; if the source thread is currently mid-turn, the fork records the same interruption marker as `turn/interrupt` instead of inheriting an unmarked partial turn suffix. Accepts `ephemeral: true` for an in-memory temporary fork, emits `thread/started` (including the current `thread.status`), and auto-subscribes you to turn/item events for the new thread.
+- `thread/fork` — fork an existing thread into a new thread id by copying the stored history; if the source thread is currently mid-turn, the fork records the same interruption marker as `turn/interrupt` instead of inheriting an unmarked partial turn suffix. The returned `thread.forkedFromId` points at the source thread when known. Accepts `ephemeral: true` for an in-memory temporary fork, emits `thread/started` (including the current `thread.status`), and auto-subscribes you to turn/item events for the new thread.
 - `thread/list` — page through stored rollouts; supports cursor-based pagination and optional `modelProviders`, `sourceKinds`, `archived`, `cwd`, and `searchTerm` filters. Each returned `thread` includes `status` (`ThreadStatus`), defaulting to `notLoaded` when the thread is not currently loaded.
 - `thread/loaded/list` — list the thread ids currently loaded in memory.
 - `thread/read` — read a stored thread by id without resuming it; optionally include turns via `includeTurns`. The returned `thread` includes `status` (`ThreadStatus`), defaulting to `notLoaded` when the thread is not currently loaded.
@@ -186,7 +187,8 @@ Example with notification opt-out:
 - `mcpServer/oauth/login` — start an OAuth login for a configured MCP server; returns an `authorization_url` and later emits `mcpServer/oauthLogin/completed` once the browser flow finishes.
 - `tool/requestUserInput` — prompt the user with 1–3 short questions for a tool call and return their answers (experimental).
 - `config/mcpServer/reload` — reload MCP server config from disk and queue a refresh for loaded threads (applied on each thread's next active turn); returns `{}`. Use this after editing `config.toml` without restarting the server.
-- `mcpServerStatus/list` — enumerate configured MCP servers with their tools, resources, resource templates, and auth status; supports cursor+limit pagination.
+- `mcpServerStatus/list` — enumerate configured MCP servers with their tools and auth status, plus resources/resource templates for `full` detail; supports cursor+limit pagination. If `detail` is omitted, the server defaults to `full`.
+- `mcpServer/resource/read` — read a resource from a thread's configured MCP server by `threadId`, `server`, and `uri`, returning text/blob resource `contents`.
 - `windowsSandbox/setupStart` — start Windows sandbox setup for the selected mode (`elevated` or `unelevated`); accepts an optional absolute `cwd` to target setup for a specific workspace, returns `{ started: true }` immediately, and later emits `windowsSandbox/setupCompleted`.
 - `feedback/upload` — submit a feedback report (classification + optional reason/logs, conversation_id, and optional `extraLogFiles` attachments array); returns the tracking thread id.
 - `config/read` — fetch the effective config on disk after resolving config layering.
@@ -194,7 +196,7 @@ Example with notification opt-out:
 - `externalAgentConfig/import` — apply selected external-agent migration items by passing explicit `migrationItems` with `cwd` (`null` for home).
 - `config/value/write` — write a single config key/value to the user's config.toml on disk.
 - `config/batchWrite` — apply multiple config edits atomically to the user's config.toml on disk, with optional `reloadUserConfig: true` to hot-reload loaded threads.
-- `configRequirements/read` — fetch loaded requirements constraints from `requirements.toml` and/or MDM (or `null` if none are configured), including allow-lists (`allowedApprovalPolicies`, `allowedSandboxModes`, `allowedWebSearchModes`), pinned feature values (`featureRequirements`), `enforceResidency`, and `network` constraints.
+- `configRequirements/read` — fetch loaded requirements constraints from `requirements.toml` and/or MDM (or `null` if none are configured), including allow-lists (`allowedApprovalPolicies`, `allowedSandboxModes`, `allowedWebSearchModes`), pinned feature values (`featureRequirements`), `enforceResidency`, and `network` constraints such as canonical domain/socket permissions plus `managedAllowedDomainsOnly` and `dangerFullAccessDenylistOnly`.
 
 ### Example: Start or resume a thread
 
@@ -273,7 +275,7 @@ Experimental API: `thread/start`, `thread/resume`, and `thread/fork` accept `per
 - `modelProviders` — restrict results to specific providers; unset, null, or an empty array will include all providers.
 - `sourceKinds` — restrict results to specific sources; omit or pass `[]` for interactive sessions only (`cli`, `vscode`).
 - `archived` — when `true`, list archived threads only. When `false` or `null`, list non-archived threads (default).
-- `cwd` — restrict results to threads whose session cwd exactly matches this path.
+- `cwd` — restrict results to threads whose session cwd exactly matches this path. Relative paths are resolved against the app-server process cwd before matching.
 - `searchTerm` — restrict results to threads whose extracted title contains this substring (case-sensitive).
 - Responses include `agentNickname` and `agentRole` for AgentControl-spawned thread sub-agents when available.
 
@@ -913,10 +915,10 @@ All items emit shared lifecycle events:
 
 - `item/started` — emits the full `item` when a new unit of work begins so the UI can render it immediately; the `item.id` in this payload matches the `itemId` used by deltas.
 - `item/completed` — sends the final `item` once that work itself finishes (for example, after a tool call or message completes); treat this as the authoritative execution/result state.
-- `item/autoApprovalReview/started` — [UNSTABLE] temporary guardian notification carrying `{threadId, turnId, targetItemId, review, action?}` when guardian approval review begins. This shape is expected to change soon.
-- `item/autoApprovalReview/completed` — [UNSTABLE] temporary guardian notification carrying `{threadId, turnId, targetItemId, review, action?}` when guardian approval review resolves. This shape is expected to change soon.
+- `item/autoApprovalReview/started` — [UNSTABLE] temporary guardian notification carrying `{threadId, turnId, targetItemId, review, action}` when guardian approval review begins. This shape is expected to change soon.
+- `item/autoApprovalReview/completed` — [UNSTABLE] temporary guardian notification carrying `{threadId, turnId, targetItemId, review, action}` when guardian approval review resolves. This shape is expected to change soon.
 
-`review` is [UNSTABLE] and currently has `{status, riskScore?, riskLevel?, rationale?}`, where `status` is one of `inProgress`, `approved`, `denied`, or `aborted`. `action` is the guardian action summary payload from core when available and is intended to support temporary standalone pending-review UI. These notifications are separate from the target item's own `item/completed` lifecycle and are intentionally temporary while the guardian app protocol is still being designed.
+`review` is [UNSTABLE] and currently has `{status, riskScore?, riskLevel?, rationale?}`, where `status` is one of `inProgress`, `approved`, `denied`, or `aborted`. `action` is a tagged union with `type: "command" | "execve" | "applyPatch" | "networkAccess" | "mcpToolCall"`. Command-like actions include a `source` discriminator (`"shell"` or `"unifiedExec"`). These notifications are separate from the target item's own `item/completed` lifecycle and are intentionally temporary while the guardian app protocol is still being designed.
 
 There are additional item-specific events:
 
@@ -1019,7 +1021,7 @@ the client can offer session-scoped and/or persistent approval choices.
 
 ### Permission requests
 
-The built-in `request_permissions` tool sends an `item/permissions/requestApproval` JSON-RPC request to the client with the requested permission profile. This v2 payload mirrors the standalone tool's narrower permission shape, so it can request network access and additional filesystem access but does not include the broader `macos` branch used by command-execution `additionalPermissions`.
+The built-in `request_permissions` tool sends an `item/permissions/requestApproval` JSON-RPC request to the client with the requested permission profile. This v2 payload mirrors the command-execution `additionalPermissions` shape: it can request network access and additional filesystem access.
 
 ```json
 {
@@ -1055,7 +1057,7 @@ The client responds with `result.permissions`, which should be the granted subse
 }
 ```
 
-Only the granted subset matters on the wire. Any permissions omitted from `result.permissions` are treated as denied, including omitted nested keys inside `result.permissions.macos`, so a sparse response like `{ "permissions": { "macos": { "accessibility": true } } }` grants only accessibility. Any permissions not present in the original request are ignored by the server.
+Only the granted subset matters on the wire. Any permissions omitted from `result.permissions` are treated as denied. Any permissions not present in the original request are ignored by the server.
 
 Within the same turn, granted permissions are sticky: later shell-like tool calls can automatically reuse the granted subset without reissuing a separate permission request.
 
@@ -1309,14 +1311,14 @@ The JSON-RPC auth/account surface exposes request/response methods plus server-i
 Codex supports these authentication modes. The current mode is surfaced in `account/updated` (`authMode`), which also includes the current ChatGPT `planType` when available, and can be inferred from `account/read`.
 
 - **API key (`apiKey`)**: Caller supplies an OpenAI API key via `account/login/start` with `type: "apiKey"`. The API key is saved and used for API requests.
-- **ChatGPT managed (`chatgpt`)** (recommended): Codex owns the ChatGPT OAuth flow and refresh tokens. Start via `account/login/start` with `type: "chatgpt"`; Codex persists tokens to disk and refreshes them automatically.
+- **ChatGPT managed (`chatgpt`)** (recommended): Codex owns the ChatGPT OAuth flow and refresh tokens. Start via `account/login/start` with `type: "chatgpt"` for the browser flow or `type: "chatgptDeviceCode"` for device code; Codex persists tokens to disk and refreshes them automatically.
 
 ### API Overview
 
 - `account/read` — fetch current account info; optionally refresh tokens.
-- `account/login/start` — begin login (`apiKey`, `chatgpt`).
+- `account/login/start` — begin login (`apiKey`, `chatgpt`, `chatgptDeviceCode`).
 - `account/login/completed` (notify) — emitted when a login attempt finishes (success or error).
-- `account/login/cancel` — cancel a pending ChatGPT login by `loginId`.
+- `account/login/cancel` — cancel a pending managed ChatGPT login by `loginId`.
 - `account/logout` — sign out; triggers `account/updated`.
 - `account/updated` (notify) — emitted whenever auth mode changes (`authMode`: `apikey`, `chatgpt`, or `null`) and includes the current ChatGPT `planType` when available.
 - `account/rateLimits/read` — fetch ChatGPT rate limits; updates arrive via `account/rateLimits/updated` (notify).
@@ -1380,26 +1382,40 @@ Field notes:
    { "method": "account/updated", "params": { "authMode": "chatgpt", "planType": "plus" } }
    ```
 
-### 4) Cancel a ChatGPT login
+### 4) Log in with ChatGPT (device code flow)
+
+1. Start:
+   ```json
+   { "method": "account/login/start", "id": 4, "params": { "type": "chatgptDeviceCode" } }
+   { "id": 4, "result": { "type": "chatgptDeviceCode", "loginId": "<uuid>", "verificationUrl": "https://auth.openai.com/codex/device", "userCode": "ABCD-1234" } }
+   ```
+2. Show `verificationUrl` and `userCode` to the user; the frontend owns the UX.
+3. Wait for notifications:
+   ```json
+   { "method": "account/login/completed", "params": { "loginId": "<uuid>", "success": true, "error": null } }
+   { "method": "account/updated", "params": { "authMode": "chatgpt", "planType": "plus" } }
+   ```
+
+### 5) Cancel a ChatGPT login
 
 ```json
-{ "method": "account/login/cancel", "id": 4, "params": { "loginId": "<uuid>" } }
+{ "method": "account/login/cancel", "id": 5, "params": { "loginId": "<uuid>" } }
 { "method": "account/login/completed", "params": { "loginId": "<uuid>", "success": false, "error": "…" } }
 ```
 
-### 5) Logout
+### 6) Logout
 
 ```json
-{ "method": "account/logout", "id": 5 }
-{ "id": 5, "result": {} }
+{ "method": "account/logout", "id": 6 }
+{ "id": 6, "result": {} }
 { "method": "account/updated", "params": { "authMode": null, "planType": null } }
 ```
 
-### 6) Rate limits (ChatGPT)
+### 7) Rate limits (ChatGPT)
 
 ```json
-{ "method": "account/rateLimits/read", "id": 6 }
-{ "id": 6, "result": { "rateLimits": { "primary": { "usedPercent": 25, "windowDurationMins": 15, "resetsAt": 1730947200 }, "secondary": null } } }
+{ "method": "account/rateLimits/read", "id": 7 }
+{ "id": 7, "result": { "rateLimits": { "primary": { "usedPercent": 25, "windowDurationMins": 15, "resetsAt": 1730947200 }, "secondary": null } } }
 { "method": "account/rateLimits/updated", "params": { "rateLimits": { … } } }
 ```
 

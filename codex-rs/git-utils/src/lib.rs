@@ -42,6 +42,7 @@ pub use info::get_has_changes;
 pub use info::get_head_commit_hash;
 pub use info::git_diff_to_remote;
 pub use info::local_git_branches;
+pub use info::paths_match_or_same_repo;
 pub use info::recent_commits;
 pub use info::resolve_root_git_project_for_trust;
 pub use platform::create_symlink;

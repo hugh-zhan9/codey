@@ -57,7 +57,6 @@ use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_state::StateRuntime;
 use codex_state::ThreadMetadataBuilder;
-use codex_utils_path as path_utils;
 
 /// Records all [`ResponseItem`]s for a session and flushes them to disk after
 /// every update.
@@ -82,7 +81,7 @@ pub enum RolloutRecorderParams {
         conversation_id: ThreadId,
         forked_from_id: Option<ThreadId>,
         source: SessionSource,
-        base_instructions: BaseInstructions,
+        base_instructions: Option<BaseInstructions>,
         dynamic_tools: Vec<DynamicToolSpec>,
         event_persistence_mode: EventPersistenceMode,
     },
@@ -111,7 +110,7 @@ impl RolloutRecorderParams {
         conversation_id: ThreadId,
         forked_from_id: Option<ThreadId>,
         source: SessionSource,
-        base_instructions: BaseInstructions,
+        base_instructions: Option<BaseInstructions>,
         dynamic_tools: Vec<DynamicToolSpec>,
         event_persistence_mode: EventPersistenceMode,
     ) -> Self {

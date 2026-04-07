@@ -4,8 +4,8 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::path::PathBuf;
 
-use crate::path_utils;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path as path_utils;
 use futures::future::join_all;
 use schemars::JsonSchema;
 use serde::Deserialize;

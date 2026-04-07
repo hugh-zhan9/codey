@@ -68,3 +68,27 @@
 - `codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__slash_reload_info_message.snap`
 - `codex-rs/tui/src/bottom_pane/chat_composer.rs`
 ----------------------------------------
+## [2026-04-07 18:04] [Bugfix]
+- **Change**: 合并 upstream openai/codex 最新 main，解决 TUI/exec 冲突并保留本地会话恢复与 /reload 改动
+- **Risk Analysis**: 风险主要在 TUI 会话恢复、/reload 账号状态刷新以及同仓库路径匹配逻辑；已通过 codex-git-utils、codex-exec、codex-tui 测试与 fix/fmt/comment lint 验证。
+- **Risk Level**: S2（中级: 局部功能异常、可绕过但影响效率）
+- **Changed Files**:
+- `codex-rs/Cargo.lock`
+- `codex-rs/exec/src/lib.rs`
+- `codex-rs/exec/src/lib_tests.rs`
+- `codex-rs/git-utils/Cargo.toml`
+- `codex-rs/git-utils/src/info.rs`
+- `codex-rs/git-utils/src/lib.rs`
+- `codex-rs/rollout/src/recorder.rs`
+- `codex-rs/tui/src/app.rs`
+- `codex-rs/tui/src/app_event.rs`
+- `codex-rs/tui/src/bottom_pane/chat_composer.rs`
+- `codex-rs/tui/src/chatwidget.rs`
+- `codex-rs/tui/src/chatwidget/tests.rs`
+- `codex-rs/tui/src/chatwidget/tests/slash_commands.rs`
+- `codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__slash_reload_info_message.snap`
+- `codex-rs/tui/src/lib.rs`
+- `codex-rs/tui/src/resume_picker.rs`
+- `codex-rs/tui/src/snapshots/codex_tui__resume_picker__tests__resume_picker_table.snap`
+- `codex-rs/tui/src/snapshots/codex_tui__resume_picker__tests__resume_picker_thread_names.snap`
+----------------------------------------

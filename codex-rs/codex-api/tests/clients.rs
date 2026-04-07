@@ -203,7 +203,12 @@ async fn responses_client_uses_responses_path() -> Result<()> {
 
     let body = serde_json::json!({ "echo": true });
     let _stream = client
-        .stream(body, HeaderMap::new(), Compression::None, None)
+        .stream(
+            body,
+            HeaderMap::new(),
+            Compression::None,
+            /*turn_state*/ None,
+        )
         .await?;
 
     let requests = state.take_stream_requests();
@@ -220,7 +225,12 @@ async fn streaming_client_adds_auth_headers() -> Result<()> {
 
     let body = serde_json::json!({ "model": "gpt-test" });
     let _stream = client
-        .stream(body, HeaderMap::new(), Compression::None, None)
+        .stream(
+            body,
+            HeaderMap::new(),
+            Compression::None,
+            /*turn_state*/ None,
+        )
         .await?;
 
     let requests = state.take_stream_requests();
@@ -256,7 +266,7 @@ async fn streaming_client_retries_on_transport_error() -> Result<()> {
 
     let request = ResponsesApiRequest {
         model: "gpt-test".into(),
-        instructions: "Say hi".into(),
+        instructions: Some("Say hi".into()),
         input: Vec::new(),
         tools: Vec::new(),
         tool_choice: "auto".into(),
@@ -292,7 +302,7 @@ async fn azure_default_store_attaches_ids_and_headers() -> Result<()> {
 
     let request = ResponsesApiRequest {
         model: "gpt-test".into(),
-        instructions: "Say hi".into(),
+        instructions: Some("Say hi".into()),
         input: vec![ResponseItem::Message {
             id: Some("msg_1".into()),
             role: "user".into(),
