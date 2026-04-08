@@ -81,6 +81,7 @@ pub(crate) struct ConnectorsSnapshot {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReloadedAccountState {
+    pub(crate) current_account_alias: Option<String>,
     pub(crate) status_account_display: Option<StatusAccountDisplay>,
     pub(crate) plan_type: Option<codex_protocol::account::PlanType>,
     pub(crate) has_chatgpt_account: bool,

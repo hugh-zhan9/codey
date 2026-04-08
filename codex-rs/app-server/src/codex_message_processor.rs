@@ -486,6 +486,8 @@ enum RefreshTokenRequestPolicy {
     Force,
 }
 
+const PRE_FLIGHT_USAGE_HEALTH_TTL_SECS: i64 = 60;
+
 pub(crate) struct CodexMessageProcessorArgs {
     pub(crate) auth_manager: Arc<AuthManager>,
     pub(crate) thread_manager: Arc<ThreadManager>,
@@ -2004,6 +2006,20 @@ impl CodexMessageProcessor {
         }
     }
 
+    fn cached_quota_exhausted_for_preflight(
+        account_pool: &codex_login::account_pool::AccountPoolFile,
+        current_alias: &str,
+    ) -> Option<bool> {
+        let account = account_pool
+            .accounts
+            .iter()
+            .find(|account| account.alias == current_alias)?;
+        let last_checked_at = account.usage_health.last_checked_at?;
+        (last_checked_at
+            >= Utc::now() - chrono::Duration::seconds(PRE_FLIGHT_USAGE_HEALTH_TTL_SECS))
+        .then_some(account.usage_health.quota_exhausted)
+    }
+
     async fn maybe_preflight_account_switch(
         &self,
         thread: &Arc<CodexThread>,
@@ -2030,7 +2046,7 @@ impl CodexMessageProcessor {
         if account_pool.accounts.len() <= 1 {
             return Ok(());
         }
-        let Some(current_alias) = account_pool.current_alias else {
+        let Some(current_alias) = account_pool.current_alias.as_deref() else {
             return Ok(());
         };
 
@@ -2042,23 +2058,29 @@ impl CodexMessageProcessor {
             RefreshTokenRequestOutcome::FailedPermanently
         );
         if should_switch {
-            let _ = manager.mark_account_needs_relogin(&current_alias);
+            let _ = manager.mark_account_needs_relogin(current_alias);
         }
 
-        if !should_switch && let Ok((primary, _)) = self.fetch_account_rate_limits().await {
-            let five_hour_remaining_percent = Self::remaining_percent(primary.primary.as_ref());
-            let five_hour_resets_at = Self::resets_at(primary.primary.as_ref());
-            let weekly_remaining_percent = Self::remaining_percent(primary.secondary.as_ref());
-            let weekly_resets_at = Self::resets_at(primary.secondary.as_ref());
-            let _ = manager.update_account_usage_health(
-                &current_alias,
-                five_hour_remaining_percent,
-                five_hour_resets_at,
-                weekly_remaining_percent,
-                weekly_resets_at,
-            );
-            should_switch =
-                five_hour_remaining_percent == Some(0) || weekly_remaining_percent == Some(0);
+        if !should_switch {
+            if let Some(cached_quota_exhausted) =
+                Self::cached_quota_exhausted_for_preflight(&account_pool, current_alias)
+            {
+                should_switch = cached_quota_exhausted;
+            } else if let Ok((primary, _)) = self.fetch_account_rate_limits().await {
+                let five_hour_remaining_percent = Self::remaining_percent(primary.primary.as_ref());
+                let five_hour_resets_at = Self::resets_at(primary.primary.as_ref());
+                let weekly_remaining_percent = Self::remaining_percent(primary.secondary.as_ref());
+                let weekly_resets_at = Self::resets_at(primary.secondary.as_ref());
+                let _ = manager.update_account_usage_health(
+                    current_alias,
+                    five_hour_remaining_percent,
+                    five_hour_resets_at,
+                    weekly_remaining_percent,
+                    weekly_resets_at,
+                );
+                should_switch =
+                    five_hour_remaining_percent == Some(0) || weekly_remaining_percent == Some(0);
+            }
         }
 
         if !should_switch {
@@ -2066,7 +2088,7 @@ impl CodexMessageProcessor {
         }
 
         let Some(next_alias) = manager
-            .select_best_switch_target(Some(&current_alias))
+            .select_best_switch_target(Some(current_alias))
             .map_err(|err| JSONRPCErrorError {
                 code: INTERNAL_ERROR_CODE,
                 message: format!("failed to select account switch target: {err}"),

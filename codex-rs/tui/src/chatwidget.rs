@@ -608,6 +608,7 @@ pub(crate) struct ChatWidgetInit {
     pub(crate) model_catalog: Arc<ModelCatalog>,
     pub(crate) feedback: codex_feedback::CodexFeedback,
     pub(crate) is_first_run: bool,
+    pub(crate) current_account_alias: Option<String>,
     pub(crate) status_account_display: Option<StatusAccountDisplay>,
     pub(crate) initial_plan_type: Option<PlanType>,
     pub(crate) model: Option<String>,
@@ -810,6 +811,7 @@ pub(crate) struct ChatWidget {
     /// The currently active collaboration mask, if any.
     active_collaboration_mask: Option<CollaborationModeMask>,
     has_chatgpt_account: bool,
+    current_account_alias: Option<String>,
     model_catalog: Arc<ModelCatalog>,
     session_telemetry: SessionTelemetry,
     session_header: SessionHeader,
@@ -1007,6 +1009,9 @@ pub(crate) struct ChatWidget {
     realtime_conversation: RealtimeConversationUiState,
     last_rendered_user_message_event: Option<RenderedUserMessageEvent>,
     last_non_retry_error: Option<(String, String)>,
+    pending_auto_retry_user_turn: Option<AppCommand>,
+    auto_retry_attempted_for_pending_turn: bool,
+    auto_switch_in_flight: bool,
 }
 
 /// Cached nickname and role for a collab agent thread, used to attach human-readable labels to
@@ -2800,7 +2805,11 @@ impl ChatWidget {
         if matches!(
             kind,
             RateLimitErrorKind::UsageLimit | RateLimitErrorKind::Generic
-        ) {
+        ) && self.pending_auto_retry_user_turn.is_some()
+            && !self.auto_retry_attempted_for_pending_turn
+            && !self.auto_switch_in_flight
+        {
+            self.auto_switch_in_flight = true;
             self.app_event_tx.send(AppEvent::AutoSwitchAccount);
         }
     }
@@ -4621,6 +4630,7 @@ impl ChatWidget {
             model_catalog,
             feedback,
             is_first_run,
+            current_account_alias,
             status_account_display,
             initial_plan_type,
             model,
@@ -4683,6 +4693,7 @@ impl ChatWidget {
             current_collaboration_mode,
             active_collaboration_mask,
             has_chatgpt_account,
+            current_account_alias,
             model_catalog,
             session_telemetry,
             session_header: SessionHeader::new(header_model),
@@ -4778,6 +4789,9 @@ impl ChatWidget {
             realtime_conversation: RealtimeConversationUiState::default(),
             last_rendered_user_message_event: None,
             last_non_retry_error: None,
+            pending_auto_retry_user_turn: None,
+            auto_retry_attempted_for_pending_turn: false,
+            auto_switch_in_flight: false,
         };
 
         widget
@@ -5886,6 +5900,8 @@ impl ChatWidget {
             collaboration_mode,
             personality,
         );
+        self.pending_auto_retry_user_turn = Some(op.clone());
+        self.auto_retry_attempted_for_pending_turn = false;
 
         if !self.submit_op(op) {
             return;
@@ -6687,10 +6703,12 @@ impl ChatWidget {
     ) {
         match notification.turn.status {
             TurnStatus::Completed => {
+                self.clear_auto_retry_state();
                 self.last_non_retry_error = None;
                 self.on_task_complete(/*last_agent_message*/ None, replay_kind.is_some())
             }
             TurnStatus::Interrupted => {
+                self.clear_auto_retry_state();
                 self.last_non_retry_error = None;
                 self.on_interrupted_turn(TurnAbortReason::Interrupted);
             }
@@ -9570,6 +9588,10 @@ impl ChatWidget {
         self.status_account_display.as_ref()
     }
 
+    pub(crate) fn current_account_alias(&self) -> Option<&String> {
+        self.current_account_alias.as_ref()
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn model_catalog(&self) -> Arc<ModelCatalog> {
         self.model_catalog.clone()
@@ -9585,10 +9607,12 @@ impl ChatWidget {
 
     pub(crate) fn update_account_state(
         &mut self,
+        current_account_alias: Option<String>,
         status_account_display: Option<StatusAccountDisplay>,
         plan_type: Option<PlanType>,
         has_chatgpt_account: bool,
     ) {
+        self.current_account_alias = current_account_alias;
         self.status_account_display = status_account_display;
         self.plan_type = plan_type;
         self.has_chatgpt_account = has_chatgpt_account;
@@ -9597,10 +9621,12 @@ impl ChatWidget {
     }
 
     pub(crate) fn on_account_reloaded(&mut self, account_state: ReloadedAccountState) {
+        self.auto_switch_in_flight = false;
         self.rate_limit_snapshots_by_limit_id.clear();
         self.rate_limit_warnings = RateLimitWarningState::default();
         self.rate_limit_switch_prompt = RateLimitSwitchPromptState::default();
         self.update_account_state(
+            account_state.current_account_alias,
             account_state.status_account_display,
             account_state.plan_type,
             account_state.has_chatgpt_account,
@@ -9610,6 +9636,20 @@ impl ChatWidget {
         }
         self.refresh_status_surfaces();
         self.add_info_message(account_state.message, account_state.hint);
+    }
+
+    pub(crate) fn take_pending_auto_retry_user_turn(&mut self) -> Option<AppCommand> {
+        if self.auto_retry_attempted_for_pending_turn {
+            return None;
+        }
+        self.auto_retry_attempted_for_pending_turn = true;
+        self.pending_auto_retry_user_turn.clone()
+    }
+
+    pub(crate) fn clear_auto_retry_state(&mut self) {
+        self.pending_auto_retry_user_turn = None;
+        self.auto_retry_attempted_for_pending_turn = false;
+        self.auto_switch_in_flight = false;
     }
 
     pub(crate) fn on_account_pool_loaded(&mut self, response: AccountPoolListResponse) {

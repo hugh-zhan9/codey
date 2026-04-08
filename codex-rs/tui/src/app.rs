@@ -14,6 +14,7 @@ use crate::app_server_session::AppServerSession;
 use crate::app_server_session::AppServerStartedThread;
 use crate::app_server_session::ThreadSessionState;
 use crate::app_server_session::app_server_rate_limit_snapshots_to_core;
+use crate::app_server_session::current_account_alias_from_account_pool;
 use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::FeedbackAudience;
 use crate::bottom_pane::McpServerElicitationFormRequest;
@@ -1104,6 +1105,7 @@ impl App {
             model_catalog: self.model_catalog.clone(),
             feedback: self.feedback.clone(),
             is_first_run: false,
+            current_account_alias: self.chat_widget.current_account_alias().cloned(),
             status_account_display: self.chat_widget.status_account_display().cloned(),
             initial_plan_type: self.chat_widget.current_plan_type(),
             model: Some(self.chat_widget.current_model().to_string()),
@@ -1921,10 +1923,17 @@ impl App {
     fn reload_account(&mut self, app_server: &AppServerSession) {
         let request_handle = app_server.request_handle();
         let app_event_tx = self.app_event_tx.clone();
+        let codex_home = self.config.codex_home.clone();
+        let auth_credentials_store_mode = self.config.cli_auth_credentials_store_mode;
         tokio::spawn(async move {
-            let result = fetch_reloaded_account_state(request_handle, /*do_refresh*/ false)
-                .await
-                .map_err(|err| err.to_string());
+            let result = fetch_reloaded_account_state(
+                request_handle,
+                &codex_home,
+                auth_credentials_store_mode,
+                /*do_refresh*/ false,
+            )
+            .await
+            .map_err(|err| err.to_string());
             app_event_tx.send(AppEvent::AccountReloaded { result });
         });
     }
@@ -1932,10 +1941,16 @@ impl App {
     fn auto_switch_account(&mut self, app_server: &AppServerSession) {
         let request_handle = app_server.request_handle();
         let app_event_tx = self.app_event_tx.clone();
+        let codex_home = self.config.codex_home.clone();
+        let auth_credentials_store_mode = self.config.cli_auth_credentials_store_mode;
         tokio::spawn(async move {
-            let result = fetch_auto_switched_account_state(request_handle)
-                .await
-                .map_err(|err| err.to_string());
+            let result = fetch_auto_switched_account_state(
+                request_handle,
+                &codex_home,
+                auth_credentials_store_mode,
+            )
+            .await
+            .map_err(|err| err.to_string());
             app_event_tx.send(AppEvent::AccountAutoSwitched { result });
         });
     }
@@ -1974,10 +1989,17 @@ impl App {
     fn switch_account_pool(&mut self, app_server: &AppServerSession, alias: String) {
         let request_handle = app_server.request_handle();
         let app_event_tx = self.app_event_tx.clone();
+        let codex_home = self.config.codex_home.clone();
+        let auth_credentials_store_mode = self.config.cli_auth_credentials_store_mode;
         tokio::spawn(async move {
-            let result = switch_account_pool(request_handle, alias)
-                .await
-                .map_err(|err| err.to_string());
+            let result = switch_account_pool(
+                request_handle,
+                &codex_home,
+                auth_credentials_store_mode,
+                alias,
+            )
+            .await
+            .map_err(|err| err.to_string());
             app_event_tx.send(AppEvent::AccountPoolSwitched { result });
         });
     }
@@ -1985,10 +2007,16 @@ impl App {
     fn switch_next_account_pool(&mut self, app_server: &AppServerSession) {
         let request_handle = app_server.request_handle();
         let app_event_tx = self.app_event_tx.clone();
+        let codex_home = self.config.codex_home.clone();
+        let auth_credentials_store_mode = self.config.cli_auth_credentials_store_mode;
         tokio::spawn(async move {
-            let result = fetch_auto_switched_account_state(request_handle)
-                .await
-                .map_err(|err| err.to_string());
+            let result = fetch_auto_switched_account_state(
+                request_handle,
+                &codex_home,
+                auth_credentials_store_mode,
+            )
+            .await
+            .map_err(|err| err.to_string());
             app_event_tx.send(AppEvent::NextAccountPoolSwitched { result });
         });
     }
@@ -3749,6 +3777,7 @@ impl App {
                     model_catalog: model_catalog.clone(),
                     feedback: feedback.clone(),
                     is_first_run,
+                    current_account_alias: bootstrap.current_account_alias.clone(),
                     status_account_display: status_account_display.clone(),
                     initial_plan_type,
                     model: Some(model.clone()),
@@ -3783,6 +3812,7 @@ impl App {
                     model_catalog: model_catalog.clone(),
                     feedback: feedback.clone(),
                     is_first_run,
+                    current_account_alias: bootstrap.current_account_alias.clone(),
                     status_account_display: status_account_display.clone(),
                     initial_plan_type,
                     model: config.model.clone(),
@@ -3822,6 +3852,7 @@ impl App {
                     model_catalog: model_catalog.clone(),
                     feedback: feedback.clone(),
                     is_first_run,
+                    current_account_alias: bootstrap.current_account_alias.clone(),
                     status_account_display: status_account_display.clone(),
                     initial_plan_type,
                     model: config.model.clone(),
@@ -4541,9 +4572,17 @@ impl App {
             AppEvent::AccountAutoSwitched { result } => match result {
                 Ok(Some(state)) => {
                     self.chat_widget.on_account_reloaded(state);
+                    if let Some(op) = self.chat_widget.take_pending_auto_retry_user_turn() {
+                        self.chat_widget.add_info_message(
+                            "Retrying the last request with the switched account.".to_string(),
+                            /*hint*/ None,
+                        );
+                        self.submit_active_thread_op(app_server, op.into()).await?;
+                    }
                 }
-                Ok(None) => {}
+                Ok(None) => self.chat_widget.clear_auto_retry_state(),
                 Err(err) => {
+                    self.chat_widget.clear_auto_retry_state();
                     tracing::warn!("accountPool/switchNext failed during TUI auto-switch: {err}");
                     self.chat_widget
                         .add_error_message(format!("Failed to switch account: {err}"));
@@ -6215,6 +6254,8 @@ async fn fetch_account_rate_limits(
 
 async fn fetch_reloaded_account_state(
     request_handle: AppServerRequestHandle,
+    codex_home: &std::path::Path,
+    auth_credentials_store_mode: codex_config::types::AuthCredentialsStoreMode,
     do_refresh: bool,
 ) -> Result<ReloadedAccountState> {
     let request_id = RequestId::String(format!("account-read-{}", Uuid::new_v4()));
@@ -6228,6 +6269,8 @@ async fn fetch_reloaded_account_state(
         .await
         .wrap_err("account/read failed in TUI")?;
     let requires_openai_auth = response.requires_openai_auth;
+    let current_account_alias =
+        current_account_alias_from_account_pool(codex_home, auth_credentials_store_mode);
 
     let (status_account_display, plan_type, has_chatgpt_account, message, hint) =
         match response.account {
@@ -6273,6 +6316,7 @@ async fn fetch_reloaded_account_state(
     };
 
     Ok(ReloadedAccountState {
+        current_account_alias,
         status_account_display,
         plan_type,
         has_chatgpt_account,
@@ -6312,6 +6356,8 @@ async fn import_account_pool(
 
 async fn switch_account_pool(
     request_handle: AppServerRequestHandle,
+    codex_home: &std::path::Path,
+    auth_credentials_store_mode: codex_config::types::AuthCredentialsStoreMode,
     alias: String,
 ) -> Result<ReloadedAccountState> {
     let request_id = RequestId::String(format!("account-pool-switch-{}", Uuid::new_v4()));
@@ -6324,7 +6370,13 @@ async fn switch_account_pool(
         })
         .await
         .wrap_err("accountPool/switch failed in TUI")?;
-    let mut reloaded = fetch_reloaded_account_state(request_handle, /*do_refresh*/ true).await?;
+    let mut reloaded = fetch_reloaded_account_state(
+        request_handle,
+        codex_home,
+        auth_credentials_store_mode,
+        /*do_refresh*/ true,
+    )
+    .await?;
     reloaded.message = match response.current_alias {
         Some(current_alias) => {
             format!("Switched to account `{current_alias}` and reloaded auth state.")
@@ -6336,6 +6388,8 @@ async fn switch_account_pool(
 
 async fn fetch_auto_switched_account_state(
     request_handle: AppServerRequestHandle,
+    codex_home: &std::path::Path,
+    auth_credentials_store_mode: codex_config::types::AuthCredentialsStoreMode,
 ) -> Result<Option<ReloadedAccountState>> {
     let request_id = RequestId::String(format!("account-pool-switch-next-{}", Uuid::new_v4()));
     let response: AccountPoolSwitchNextResponse = request_handle
@@ -6348,7 +6402,13 @@ async fn fetch_auto_switched_account_state(
     if !response.switched {
         return Ok(None);
     }
-    let mut reloaded = fetch_reloaded_account_state(request_handle, /*do_refresh*/ true).await?;
+    let mut reloaded = fetch_reloaded_account_state(
+        request_handle,
+        codex_home,
+        auth_credentials_store_mode,
+        /*do_refresh*/ true,
+    )
+    .await?;
     reloaded.message = match response.current_alias {
         Some(alias) => format!("Switched to backup account `{alias}` and reloaded auth state."),
         None => "Switched to backup account and reloaded auth state.".to_string(),
@@ -6859,6 +6919,7 @@ mod tests {
             model_catalog: app.model_catalog.clone(),
             feedback: codex_feedback::CodexFeedback::new(),
             is_first_run: false,
+            current_account_alias: None,
             status_account_display: None,
             initial_plan_type: None,
             model: Some(model),
@@ -10817,6 +10878,7 @@ guardian_approval = true
             model_catalog: app.model_catalog.clone(),
             feedback: app.feedback.clone(),
             is_first_run: false,
+            current_account_alias: app.chat_widget.current_account_alias().cloned(),
             status_account_display: app.chat_widget.status_account_display().cloned(),
             initial_plan_type: app.chat_widget.current_plan_type(),
             model: Some(app.chat_widget.current_model().to_string()),

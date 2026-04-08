@@ -86,9 +86,11 @@ use color_eyre::eyre::ContextCompat;
 use color_eyre::eyre::Result;
 use color_eyre::eyre::WrapErr;
 use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
 
 pub(crate) struct AppServerBootstrap {
+    pub(crate) current_account_alias: Option<String>,
     pub(crate) account_auth_mode: Option<AuthMode>,
     pub(crate) account_email: Option<String>,
     pub(crate) auth_mode: Option<TelemetryAuthMode>,
@@ -210,6 +212,10 @@ impl AppServerSession {
             .or_else(|| available_models.first().map(|model| model.model.clone()))
             .wrap_err("model/list returned no models for TUI bootstrap")?;
 
+        let current_account_alias = current_account_alias_from_account_pool(
+            &config.codex_home,
+            config.cli_auth_credentials_store_mode,
+        );
         let (
             account_auth_mode,
             account_email,
@@ -278,6 +284,7 @@ impl AppServerSession {
         };
 
         Ok(AppServerBootstrap {
+            current_account_alias,
             account_auth_mode,
             account_email,
             auth_mode,
@@ -749,6 +756,19 @@ impl AppServerSession {
         self.next_request_id += 1;
         RequestId::Integer(request_id)
     }
+}
+
+pub(crate) fn current_account_alias_from_account_pool(
+    codex_home: &Path,
+    auth_credentials_store_mode: codex_config::types::AuthCredentialsStoreMode,
+) -> Option<String> {
+    codex_login::account_pool::AccountPoolManager::new(
+        codex_home.to_path_buf(),
+        auth_credentials_store_mode,
+    )
+    .load()
+    .ok()
+    .and_then(|account_pool| account_pool.current_alias)
 }
 
 pub(crate) fn status_account_display_from_auth_mode(

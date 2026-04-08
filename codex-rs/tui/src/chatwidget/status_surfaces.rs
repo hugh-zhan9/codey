@@ -143,6 +143,9 @@ impl ChatWidget {
         }
 
         let mut parts = Vec::new();
+        if let Some(alias) = &self.current_account_alias {
+            parts.push(alias.clone());
+        }
         for item in &selections.status_line_items {
             if let Some(value) = self.status_line_value_for_item(item) {
                 parts.push(value);

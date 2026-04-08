@@ -172,6 +172,7 @@ impl App {
             }
             ServerNotification::AccountUpdated(notification) => {
                 self.chat_widget.update_account_state(
+                    self.chat_widget.current_account_alias().cloned(),
                     status_account_display_from_auth_mode(
                         notification.auth_mode,
                         notification.plan_type,
