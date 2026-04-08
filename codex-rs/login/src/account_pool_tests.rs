@@ -304,7 +304,8 @@ fn account_pool_manager_clear_current_alias_resets_active_pointer() -> anyhow::R
 }
 
 #[test]
-fn account_pool_manager_prefers_most_recent_quota_refresh_when_switching() -> anyhow::Result<()> {
+fn account_pool_manager_prefers_plan_priority_before_reset_time_when_switching()
+-> anyhow::Result<()> {
     let codex_home = tempdir()?;
     let manager = AccountPoolManager::new(
         codex_home.path().to_path_buf(),
@@ -316,21 +317,22 @@ fn account_pool_manager_prefers_most_recent_quota_refresh_when_switching() -> an
     let mut relogin = sample_account("relogin");
     relogin.token_health.needs_relogin = true;
     relogin.switch_policy_state.priority = Some(90);
-    let mut stale_but_higher_priority = sample_account("stale-but-higher-priority");
-    stale_but_higher_priority.switch_policy_state.priority = Some(100);
-    stale_but_higher_priority.usage_health.last_checked_at =
-        Some(Utc::now() - chrono::Duration::minutes(10));
-    let mut fresh = sample_account("fresh");
-    fresh.switch_policy_state.priority = Some(10);
-    fresh.usage_health.last_checked_at = Some(Utc::now());
+    let mut team = sample_account("team");
+    team.account_identity.plan_type = Some("team".to_string());
+    team.switch_policy_state.priority = Some(100);
+    team.usage_health.five_hour_resets_at = Some(1_744_204_000);
+    let mut free = sample_account("free");
+    free.account_identity.plan_type = Some("free".to_string());
+    free.switch_policy_state.priority = Some(10);
+    free.usage_health.five_hour_resets_at = Some(1_744_205_000);
     manager.upsert_account(exhausted, /*make_current*/ false)?;
     manager.upsert_account(relogin, /*make_current*/ false)?;
-    manager.upsert_account(stale_but_higher_priority, /*make_current*/ false)?;
-    manager.upsert_account(fresh, /*make_current*/ false)?;
+    manager.upsert_account(team, /*make_current*/ false)?;
+    manager.upsert_account(free, /*make_current*/ false)?;
 
-    let selected = manager.select_best_switch_target(Some("stale-but-higher-priority"))?;
+    let selected = manager.select_best_switch_target(None)?;
 
-    assert_eq!(selected.as_deref(), Some("fresh"));
+    assert_eq!(selected.as_deref(), Some("free"));
     Ok(())
 }
 

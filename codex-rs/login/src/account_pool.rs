@@ -371,8 +371,12 @@ impl AccountPoolManager {
             })
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
-            next_quota_reset_at(&left.usage_health)
-                .cmp(&next_quota_reset_at(&right.usage_health))
+            plan_sort_priority(&left.account_identity.plan_type)
+                .cmp(&plan_sort_priority(&right.account_identity.plan_type))
+                .then_with(|| {
+                    next_quota_reset_at(&left.usage_health)
+                        .cmp(&next_quota_reset_at(&right.usage_health))
+                })
                 .then_with(|| {
                     right
                         .switch_policy_state
@@ -551,6 +555,15 @@ fn next_quota_reset_at(usage_health: &UsageHealth) -> Option<i64> {
     .into_iter()
     .flatten()
     .min()
+}
+
+fn plan_sort_priority(plan_type: &Option<String>) -> u8 {
+    match plan_type.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("free") => 0,
+        Some("team") => 1,
+        Some("plus") => 2,
+        _ => 3,
+    }
 }
 
 #[derive(Debug, Deserialize)]

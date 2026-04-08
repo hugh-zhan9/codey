@@ -143,8 +143,8 @@ impl ChatWidget {
         }
 
         let mut parts = Vec::new();
-        if let Some(alias) = &self.current_account_alias {
-            parts.push(alias.clone());
+        if let Some(account_prefix) = self.status_line_account_prefix() {
+            parts.push(account_prefix);
         }
         for item in &selections.status_line_items {
             if let Some(value) = self.status_line_value_for_item(item) {
@@ -158,6 +158,20 @@ impl ChatWidget {
             Some(Line::from(parts.join(" · ")))
         };
         self.set_status_line(line);
+    }
+
+    fn status_line_account_prefix(&self) -> Option<String> {
+        let alias = self.current_account_alias.as_ref()?;
+        let plan = match self.status_account_display.as_ref() {
+            Some(StatusAccountDisplay::ChatGpt {
+                plan: Some(plan), ..
+            }) if !plan.is_empty() => Some(plan.as_str()),
+            _ => None,
+        };
+        Some(match plan {
+            Some(plan) => format!("{alias} ({plan})"),
+            None => alias.clone(),
+        })
     }
 
     /// Clears the terminal title Codex most recently wrote, if any.

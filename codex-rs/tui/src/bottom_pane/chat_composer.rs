@@ -2166,6 +2166,14 @@ impl ChatComposer {
         should_queue: bool,
         now: Instant,
     ) -> (InputResult, bool) {
+        if !self.disable_paste_burst
+            && self.paste_burst.has_pending_first_char_only()
+            && let Some(typed) = self.paste_burst.flush_before_modified_input()
+        {
+            self.textarea.insert_str(&typed);
+            self.paste_burst.clear_window_after_non_char();
+        }
+
         // If the first line is a bare built-in slash command (no args),
         // dispatch it even when the slash popup isn't visible. This preserves
         // the workflow: type a prefix ("/di"), press Tab to complete to
@@ -7697,6 +7705,33 @@ mod tests {
         assert!(flushed, "expected pending first char to flush");
         assert_eq!(composer.textarea.text(), "h");
         assert!(!composer.is_in_paste_burst());
+    }
+
+    #[test]
+    fn pending_first_ascii_char_submits_immediately_on_enter() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            /*has_input_focus*/ true,
+            sender,
+            /*enhanced_keys_supported*/ false,
+            "Ask Codex to do anything".to_string(),
+            /*disable_paste_burst*/ false,
+        );
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert!(composer.is_in_paste_burst());
+
+        let (result, _) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match result {
+            InputResult::Submitted { text, .. } => assert_eq!(text, "h"),
+            other => panic!("expected Submitted, got: {other:?}"),
+        }
     }
 
     /// Behavior: fast "paste-like" ASCII input should buffer and then flush as a single paste. If

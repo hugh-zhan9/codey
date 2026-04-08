@@ -419,6 +419,12 @@ impl PasteBurst {
         Some(out)
     }
 
+    /// Returns true when the detector is only holding a single fast first ASCII
+    /// char and has not promoted the input into a real burst buffer.
+    pub fn has_pending_first_char_only(&self) -> bool {
+        self.pending_first_char.is_some() && !self.is_active_internal()
+    }
+
     /// Clear only the timing window and any pending first-char.
     ///
     /// Does not emit or clear the buffered text itself; callers should have
