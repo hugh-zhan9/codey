@@ -74,6 +74,229 @@
       "title": "AccountLoginCompletedNotification",
       "type": "object"
     },
+    "AccountPoolAccount": {
+      "properties": {
+        "alias": {
+          "type": "string"
+        },
+        "email": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "isCurrent": {
+          "type": "boolean"
+        },
+        "planType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/definitions/AccountPoolSource"
+        },
+        "tokenHealth": {
+          "$ref": "#/definitions/AccountPoolTokenHealth"
+        },
+        "usageHealth": {
+          "$ref": "#/definitions/AccountPoolUsageHealth"
+        }
+      },
+      "required": [
+        "alias",
+        "isCurrent",
+        "source",
+        "tokenHealth",
+        "usageHealth"
+      ],
+      "type": "object"
+    },
+    "AccountPoolImportParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/definitions/AccountPoolImportSourceKind"
+        }
+      },
+      "required": [
+        "source"
+      ],
+      "title": "AccountPoolImportParams",
+      "type": "object"
+    },
+    "AccountPoolImportResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "currentAlias": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "importedAliases": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "skippedAliases": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "importedAliases",
+        "skippedAliases"
+      ],
+      "title": "AccountPoolImportResponse",
+      "type": "object"
+    },
+    "AccountPoolImportSourceKind": {
+      "enum": [
+        "codexAcc",
+        "ccSwitch"
+      ],
+      "type": "string"
+    },
+    "AccountPoolListParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "AccountPoolListParams",
+      "type": "object"
+    },
+    "AccountPoolListResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "accounts": {
+          "items": {
+            "$ref": "#/definitions/AccountPoolAccount"
+          },
+          "type": "array"
+        },
+        "currentAlias": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "accounts"
+      ],
+      "title": "AccountPoolListResponse",
+      "type": "object"
+    },
+    "AccountPoolSource": {
+      "enum": [
+        "native",
+        "codexAccImport",
+        "ccSwitchImport"
+      ],
+      "type": "string"
+    },
+    "AccountPoolSwitchNextParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "AccountPoolSwitchNextParams",
+      "type": "object"
+    },
+    "AccountPoolSwitchNextResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "currentAlias": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "switched": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "switched"
+      ],
+      "title": "AccountPoolSwitchNextResponse",
+      "type": "object"
+    },
+    "AccountPoolSwitchParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "alias": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "alias"
+      ],
+      "title": "AccountPoolSwitchParams",
+      "type": "object"
+    },
+    "AccountPoolSwitchResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "currentAlias": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "title": "AccountPoolSwitchResponse",
+      "type": "object"
+    },
+    "AccountPoolTokenHealth": {
+      "properties": {
+        "needsRelogin": {
+          "type": "boolean"
+        },
+        "refreshStatus": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "needsRelogin"
+      ],
+      "type": "object"
+    },
+    "AccountPoolUsageHealth": {
+      "properties": {
+        "fiveHourRemainingPercent": {
+          "format": "uint8",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "quotaExhausted": {
+          "type": "boolean"
+        },
+        "weeklyRemainingPercent": {
+          "format": "uint8",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "quotaExhausted"
+      ],
+      "type": "object"
+    },
     "AccountRateLimitsUpdatedNotification": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -1870,6 +2093,102 @@
             "params"
           ],
           "title": "Account/login/cancelRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
+                "accountPool/list"
+              ],
+              "title": "AccountPool/listRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/AccountPoolListParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "AccountPool/listRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
+                "accountPool/import"
+              ],
+              "title": "AccountPool/importRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/AccountPoolImportParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "AccountPool/importRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
+                "accountPool/switch"
+              ],
+              "title": "AccountPool/switchRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/AccountPoolSwitchParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "AccountPool/switchRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
+                "accountPool/switchNext"
+              ],
+              "title": "AccountPool/switchNextRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/AccountPoolSwitchNextParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "AccountPool/switchNextRequest",
           "type": "object"
         },
         {

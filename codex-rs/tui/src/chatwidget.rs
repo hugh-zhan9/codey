@@ -38,7 +38,54 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+use unicode_width::UnicodeWidthStr;
 use url::Url;
+
+struct AccountPoolListRow {
+    marker: String,
+    alias: String,
+    account: String,
+    plan: String,
+    five_hour: String,
+    weekly: String,
+    updated_at: String,
+}
+
+fn display_width(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
+fn pad_display(text: &str, width: usize) -> String {
+    let current_width = display_width(text);
+    if current_width >= width {
+        return text.to_string();
+    }
+    format!("{text}{}", " ".repeat(width - current_width))
+}
+
+fn truncate_display(text: &str, width: usize) -> String {
+    if display_width(text) <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".to_string();
+    }
+    let mut result = String::new();
+    let mut used_width = 0;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthStr::width(ch.encode_utf8(&mut [0; 4]));
+        if used_width + ch_width + 1 > width {
+            break;
+        }
+        result.push(ch);
+        used_width += ch_width;
+    }
+    result.push('…');
+    result
+}
 
 use self::realtime::PendingSteerCompareKey;
 use crate::app_command::AppCommand;
@@ -68,6 +115,9 @@ use crate::terminal_title::clear_terminal_title;
 use crate::terminal_title::set_terminal_title;
 use crate::text_formatting::proper_join;
 use crate::version::CODEX_CLI_VERSION;
+use codex_app_server_protocol::AccountPoolImportResponse;
+use codex_app_server_protocol::AccountPoolImportSourceKind;
+use codex_app_server_protocol::AccountPoolListResponse;
 use codex_app_server_protocol::AppSummary;
 use codex_app_server_protocol::CodexErrorInfo as AppServerCodexErrorInfo;
 use codex_app_server_protocol::CollabAgentState as AppServerCollabAgentState;
@@ -372,6 +422,7 @@ use crate::streaming::controller::PlanStreamController;
 use crate::streaming::controller::StreamController;
 
 use chrono::Local;
+use chrono::TimeZone;
 use codex_file_search::FileMatch;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelPreset;
@@ -2745,6 +2796,15 @@ impl ChatWidget {
         self.maybe_send_next_queued_input();
     }
 
+    fn maybe_auto_switch_account_after_rate_limit(&mut self, kind: &RateLimitErrorKind) {
+        if matches!(
+            kind,
+            RateLimitErrorKind::UsageLimit | RateLimitErrorKind::Generic
+        ) {
+            self.app_event_tx.send(AppEvent::AutoSwitchAccount);
+        }
+    }
+
     fn handle_non_retry_error(
         &mut self,
         message: String,
@@ -2761,7 +2821,8 @@ impl ChatWidget {
             match info {
                 RateLimitErrorKind::ServerOverloaded => self.on_server_overloaded_error(message),
                 RateLimitErrorKind::UsageLimit | RateLimitErrorKind::Generic => {
-                    self.on_error(message)
+                    self.on_error(message);
+                    self.maybe_auto_switch_account_after_rate_limit(&info);
                 }
             }
         } else {
@@ -5207,6 +5268,12 @@ impl ChatWidget {
                 self.refresh_status_surfaces();
                 self.app_event_tx.send(AppEvent::ReloadAccount);
             }
+            SlashCommand::Import => {
+                self.add_error_message("Usage: /import <codex-acc|cc-switch> [path]".to_string());
+            }
+            SlashCommand::Switch => {
+                self.app_event_tx.send(AppEvent::FetchAccountPoolList);
+            }
             // SlashCommand::Undo => {
             //     self.app_event_tx.send(AppEvent::CodexOp(Op::Undo));
             // }
@@ -5404,6 +5471,30 @@ impl ChatWidget {
             }
             SlashCommand::Reload => {
                 self.add_error_message("Usage: /reload".to_string());
+            }
+            SlashCommand::Import => {
+                let Some((source, path)) = parse_account_pool_import_args(trimmed) else {
+                    self.add_error_message(
+                        "Usage: /import <codex-acc|cc-switch> [path]".to_string(),
+                    );
+                    return;
+                };
+                self.app_event_tx
+                    .send(AppEvent::ImportAccountPool { source, path });
+                self.bottom_pane.drain_pending_submission_state();
+            }
+            SlashCommand::Switch => {
+                let switch_target = trimmed;
+                if switch_target.eq_ignore_ascii_case("list") || switch_target.is_empty() {
+                    self.app_event_tx.send(AppEvent::FetchAccountPoolList);
+                } else if switch_target.eq_ignore_ascii_case("next") {
+                    self.app_event_tx.send(AppEvent::SwitchNextAccountPool);
+                } else {
+                    self.app_event_tx.send(AppEvent::SwitchAccountPool {
+                        alias: switch_target.to_string(),
+                    });
+                }
+                self.bottom_pane.drain_pending_submission_state();
             }
             SlashCommand::Rename if !trimmed.is_empty() => {
                 self.session_telemetry
@@ -6895,7 +6986,8 @@ impl ChatWidget {
                             self.on_server_overloaded_error(message)
                         }
                         RateLimitErrorKind::UsageLimit | RateLimitErrorKind::Generic => {
-                            self.on_error(message)
+                            self.on_error(message);
+                            self.maybe_auto_switch_account_after_rate_limit(&kind);
                         }
                     }
                 } else {
@@ -9520,6 +9612,226 @@ impl ChatWidget {
         self.add_info_message(account_state.message, account_state.hint);
     }
 
+    pub(crate) fn on_account_pool_loaded(&mut self, response: AccountPoolListResponse) {
+        if response.accounts.is_empty() {
+            self.add_info_message(
+                "Account pool is empty.".to_string(),
+                Some("Use /import <codex-acc|cc-switch> [path] to import accounts.".to_string()),
+            );
+            return;
+        }
+
+        let mut lines = Vec::with_capacity(response.accounts.len() * 2 + 3);
+
+        let rows = response
+            .accounts
+            .into_iter()
+            .map(|account| AccountPoolListRow {
+                marker: if account.is_current {
+                    "是".to_string()
+                } else {
+                    String::new()
+                },
+                alias: account.alias,
+                account: account.email.unwrap_or_else(|| "-".to_string()),
+                plan: account
+                    .plan_type
+                    .map(|value| Self::title_case_account_pool_cell(&value))
+                    .unwrap_or_else(|| "-".to_string()),
+                five_hour: Self::format_account_pool_limit(
+                    account.usage_health.five_hour_remaining_percent,
+                    account.usage_health.five_hour_resets_at,
+                ),
+                weekly: Self::format_account_pool_limit(
+                    account.usage_health.weekly_remaining_percent,
+                    account.usage_health.weekly_resets_at,
+                ),
+                updated_at: Self::format_account_pool_updated_at(
+                    account.usage_health.last_checked_at,
+                ),
+            })
+            .collect::<Vec<_>>();
+
+        let alias_width = rows
+            .iter()
+            .map(|row| display_width(&row.alias))
+            .max()
+            .unwrap_or(5)
+            .max(display_width("别名"))
+            .min(14);
+        let account_width = rows
+            .iter()
+            .map(|row| display_width(&row.account))
+            .max()
+            .unwrap_or(2)
+            .max(display_width("账号"))
+            .min(30);
+        let plan_width = rows
+            .iter()
+            .map(|row| display_width(&row.plan))
+            .max()
+            .unwrap_or(4)
+            .max(display_width("套餐"))
+            .min(8);
+        let five_hour_width = rows
+            .iter()
+            .map(|row| display_width(&row.five_hour))
+            .max()
+            .unwrap_or(2)
+            .max(display_width("5h额度"))
+            .min(28);
+        let weekly_width = rows
+            .iter()
+            .map(|row| display_width(&row.weekly))
+            .max()
+            .unwrap_or(4)
+            .max(display_width("周额度"))
+            .min(28);
+        let updated_at_width = 19_usize.max(display_width("更新时间"));
+
+        let current_width = 4_usize;
+
+        let top_border = format!(
+            "┌{}┬{}┬{}┬{}┬{}┬{}┬{}┐",
+            "─".repeat(current_width + 2),
+            "─".repeat(alias_width + 2),
+            "─".repeat(account_width + 2),
+            "─".repeat(plan_width + 2),
+            "─".repeat(five_hour_width + 2),
+            "─".repeat(weekly_width + 2),
+            "─".repeat(updated_at_width + 2),
+        );
+        let middle_border = format!(
+            "├{}┼{}┼{}┼{}┼{}┼{}┼{}┤",
+            "─".repeat(current_width + 2),
+            "─".repeat(alias_width + 2),
+            "─".repeat(account_width + 2),
+            "─".repeat(plan_width + 2),
+            "─".repeat(five_hour_width + 2),
+            "─".repeat(weekly_width + 2),
+            "─".repeat(updated_at_width + 2),
+        );
+        let bottom_border = format!(
+            "└{}┴{}┴{}┴{}┴{}┴{}┴{}┘",
+            "─".repeat(current_width + 2),
+            "─".repeat(alias_width + 2),
+            "─".repeat(account_width + 2),
+            "─".repeat(plan_width + 2),
+            "─".repeat(five_hour_width + 2),
+            "─".repeat(weekly_width + 2),
+            "─".repeat(updated_at_width + 2),
+        );
+
+        lines.push(top_border);
+        lines.push(format!(
+            "│ {} │ {} │ {} │ {} │ {} │ {} │ {} │",
+            pad_display("当前", current_width),
+            pad_display("别名", alias_width),
+            pad_display("账号", account_width),
+            pad_display("套餐", plan_width),
+            pad_display("5h额度", five_hour_width),
+            pad_display("周额度", weekly_width),
+            pad_display("更新时间", updated_at_width),
+        ));
+        lines.push(middle_border.clone());
+
+        let row_count = rows.len();
+        for (index, row) in rows.into_iter().enumerate() {
+            lines.push(format!(
+                "│ {} │ {} │ {} │ {} │ {} │ {} │ {} │",
+                pad_display(&row.marker, current_width),
+                pad_display(&truncate_display(&row.alias, alias_width), alias_width),
+                pad_display(
+                    &truncate_display(&row.account, account_width),
+                    account_width
+                ),
+                pad_display(&row.plan, plan_width),
+                pad_display(
+                    &truncate_display(&row.five_hour, five_hour_width),
+                    five_hour_width
+                ),
+                pad_display(&truncate_display(&row.weekly, weekly_width), weekly_width),
+                pad_display(&row.updated_at, updated_at_width),
+            ));
+            if index + 1 != row_count {
+                lines.push(middle_border.clone());
+            }
+        }
+        lines.push(bottom_border);
+
+        self.add_plain_history_lines(
+            lines
+                .into_iter()
+                .map(Line::from)
+                .collect::<Vec<Line<'static>>>(),
+        );
+    }
+
+    pub(crate) fn on_account_pool_imported(&mut self, response: AccountPoolImportResponse) {
+        let mut lines = Vec::new();
+        if response.imported_aliases.is_empty() {
+            lines.push("No new accounts were imported.".to_string());
+        } else {
+            lines.push(format!(
+                "Imported accounts: {}",
+                response.imported_aliases.join(", ")
+            ));
+        }
+        if !response.skipped_aliases.is_empty() {
+            lines.push(format!(
+                "Skipped aliases: {}",
+                response.skipped_aliases.join(", ")
+            ));
+        }
+        if let Some(current_alias) = response.current_alias {
+            lines.push(format!("Current account: {current_alias}"));
+        }
+        self.add_info_message(lines.join("\n"), /*hint*/ None);
+    }
+
+    fn format_account_pool_limit(remaining_percent: Option<u8>, resets_at: Option<i64>) -> String {
+        let Some(remaining_percent) = remaining_percent else {
+            return "-".to_string();
+        };
+        match Self::format_account_pool_reset_at(resets_at) {
+            Some(reset_text) => format!("{remaining_percent}% 剩余（{reset_text} 恢复）"),
+            None => format!("{remaining_percent}% 剩余"),
+        }
+    }
+
+    fn format_account_pool_reset_at(resets_at: Option<i64>) -> Option<String> {
+        let local_dt = Local.timestamp_opt(resets_at?, 0).single()?;
+        let now = Local::now();
+        if local_dt.date_naive() == now.date_naive() {
+            return Some(format!("今日 {}", local_dt.format("%H:%M")));
+        }
+        Some(local_dt.format("%m-%d %H:%M").to_string())
+    }
+
+    fn format_account_pool_updated_at(updated_at: Option<i64>) -> String {
+        let Some(updated_at) = updated_at else {
+            return "-".to_string();
+        };
+        Local
+            .timestamp_opt(updated_at, 0)
+            .single()
+            .map(|local_dt| local_dt.format("%Y/%-m/%-d %H:%M:%S").to_string())
+            .unwrap_or_else(|| "-".to_string())
+    }
+
+    fn title_case_account_pool_cell(value: &str) -> String {
+        let value = value.trim();
+        if value.is_empty() {
+            return "-".to_string();
+        }
+        let mut chars = value.chars();
+        let Some(first) = chars.next() else {
+            return "-".to_string();
+        };
+        let rest = chars.as_str().to_ascii_lowercase();
+        format!("{}{}", first.to_uppercase(), rest)
+    }
+
     pub(crate) fn should_show_fast_status(
         &self,
         model: &str,
@@ -11112,6 +11424,27 @@ pub(crate) fn show_review_commit_picker_with_entries(
         search_placeholder: Some("Type to search commits".to_string()),
         ..Default::default()
     });
+}
+
+fn parse_account_pool_import_args(
+    args: &str,
+) -> Option<(AccountPoolImportSourceKind, Option<String>)> {
+    let mut parts = args.splitn(2, char::is_whitespace);
+    let source = parts.next()?.trim();
+    if source.is_empty() {
+        return None;
+    }
+    let source = match source {
+        "codex-acc" => AccountPoolImportSourceKind::CodexAcc,
+        "cc-switch" => AccountPoolImportSourceKind::CcSwitch,
+        _ => return None,
+    };
+    let path = parts
+        .next()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(ToString::to_string);
+    Some((source, path))
 }
 
 #[cfg(test)]

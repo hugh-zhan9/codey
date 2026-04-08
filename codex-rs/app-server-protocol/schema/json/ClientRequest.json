@@ -5,6 +5,47 @@
       "description": "A path that is guaranteed to be absolute and normalized (though it is not guaranteed to be canonicalized or exist on the filesystem).\n\nIMPORTANT: When deserializing an `AbsolutePathBuf`, a base path must be set using [AbsolutePathBufGuard::new]. If no base path is set, the deserialization will fail unless the path being deserialized is already absolute.",
       "type": "string"
     },
+    "AccountPoolImportParams": {
+      "properties": {
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/definitions/AccountPoolImportSourceKind"
+        }
+      },
+      "required": [
+        "source"
+      ],
+      "type": "object"
+    },
+    "AccountPoolImportSourceKind": {
+      "enum": [
+        "codexAcc",
+        "ccSwitch"
+      ],
+      "type": "string"
+    },
+    "AccountPoolListParams": {
+      "type": "object"
+    },
+    "AccountPoolSwitchNextParams": {
+      "type": "object"
+    },
+    "AccountPoolSwitchParams": {
+      "properties": {
+        "alias": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "alias"
+      ],
+      "type": "object"
+    },
     "ApprovalsReviewer": {
       "description": "Configures who approval requests are routed to for review. Examples include sandbox escapes, blocked network access, MCP approval prompts, and ARC escalations. Defaults to `user`. `guardian_subagent` uses a carefully prompted subagent to gather relevant context and apply a risk-based decision framework before approving or denying the request.",
       "enum": [
@@ -4551,6 +4592,102 @@
         "params"
       ],
       "title": "Account/login/cancelRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "accountPool/list"
+          ],
+          "title": "AccountPool/listRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/AccountPoolListParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "AccountPool/listRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "accountPool/import"
+          ],
+          "title": "AccountPool/importRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/AccountPoolImportParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "AccountPool/importRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "accountPool/switch"
+          ],
+          "title": "AccountPool/switchRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/AccountPoolSwitchParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "AccountPool/switchRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "accountPool/switchNext"
+          ],
+          "title": "AccountPool/switchNextRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/AccountPoolSwitchNextParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "AccountPool/switchNextRequest",
       "type": "object"
     },
     {

@@ -49,6 +49,8 @@ pub enum SlashCommand {
     Quit,
     Exit,
     Feedback,
+    Import,
+    Switch,
     Rollout,
     Ps,
     #[strum(to_string = "stop", serialize = "clean")]
@@ -72,6 +74,8 @@ impl SlashCommand {
     pub fn description(self) -> &'static str {
         match self {
             SlashCommand::Feedback => "send logs to maintainers",
+            SlashCommand::Import => "import account pool entries from codex-acc or cc-switch",
+            SlashCommand::Switch => "list pooled accounts or switch the active pooled account",
             SlashCommand::New => "start a new chat during a conversation",
             SlashCommand::Init => "create an AGENTS.md file with instructions for Codex",
             SlashCommand::Compact => "summarize conversation to prevent hitting the context limit",
@@ -135,6 +139,8 @@ impl SlashCommand {
                 | SlashCommand::Plan
                 | SlashCommand::Fast
                 | SlashCommand::Reload
+                | SlashCommand::Import
+                | SlashCommand::Switch
                 | SlashCommand::SandboxReadRoot
         )
     }
@@ -161,6 +167,8 @@ impl SlashCommand {
             | SlashCommand::Clear
             | SlashCommand::Logout
             | SlashCommand::Reload
+            | SlashCommand::Import
+            | SlashCommand::Switch
             | SlashCommand::MemoryDrop
             | SlashCommand::MemoryUpdate => false,
             SlashCommand::Diff

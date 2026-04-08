@@ -161,6 +161,122 @@ async fn reload_result_updates_account_state_and_shows_info_message() {
 }
 
 #[tokio::test]
+async fn slash_import_dispatches_account_pool_import_event() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.dispatch_command_with_args(
+        SlashCommand::Import,
+        "codex-acc /tmp/codex-cc.json".to_string(),
+        Vec::new(),
+    );
+
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::ImportAccountPool {
+            source: codex_app_server_protocol::AccountPoolImportSourceKind::CodexAcc,
+            path: Some(path),
+        }) if path == "/tmp/codex-cc.json"
+    );
+}
+
+#[tokio::test]
+async fn slash_switch_dispatches_list_by_default() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.dispatch_command(SlashCommand::Switch);
+
+    assert_matches!(rx.try_recv(), Ok(AppEvent::FetchAccountPoolList));
+}
+
+#[tokio::test]
+async fn slash_switch_next_dispatches_manual_switch_event() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.dispatch_command_with_args(SlashCommand::Switch, "next".to_string(), Vec::new());
+
+    assert_matches!(rx.try_recv(), Ok(AppEvent::SwitchNextAccountPool));
+}
+
+#[tokio::test]
+async fn slash_switch_alias_dispatches_switch_event() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.dispatch_command_with_args(SlashCommand::Switch, "backup-2".to_string(), Vec::new());
+
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::SwitchAccountPool { alias }) if alias == "backup-2"
+    );
+}
+
+#[tokio::test]
+async fn account_pool_list_renders_current_and_accounts() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.on_account_pool_loaded(codex_app_server_protocol::AccountPoolListResponse {
+        current_alias: Some("primary".to_string()),
+        accounts: vec![
+            codex_app_server_protocol::AccountPoolAccount {
+                alias: "primary".to_string(),
+                source: codex_app_server_protocol::AccountPoolSource::Native,
+                email: Some("one@example.com".to_string()),
+                plan_type: Some("plus".to_string()),
+                token_health: codex_app_server_protocol::AccountPoolTokenHealth {
+                    refresh_status: Some("ok".to_string()),
+                    needs_relogin: false,
+                },
+                usage_health: codex_app_server_protocol::AccountPoolUsageHealth {
+                    five_hour_remaining_percent: Some(80),
+                    five_hour_resets_at: Some(1_744_204_860),
+                    weekly_remaining_percent: Some(50),
+                    weekly_resets_at: Some(1_744_808_860),
+                    last_checked_at: Some(1_744_188_851),
+                    quota_exhausted: false,
+                },
+                is_current: true,
+            },
+            codex_app_server_protocol::AccountPoolAccount {
+                alias: "backup".to_string(),
+                source: codex_app_server_protocol::AccountPoolSource::CodexAccImport,
+                email: None,
+                plan_type: None,
+                token_health: codex_app_server_protocol::AccountPoolTokenHealth {
+                    refresh_status: None,
+                    needs_relogin: false,
+                },
+                usage_health: codex_app_server_protocol::AccountPoolUsageHealth {
+                    five_hour_remaining_percent: None,
+                    five_hour_resets_at: None,
+                    weekly_remaining_percent: None,
+                    weekly_resets_at: None,
+                    last_checked_at: None,
+                    quota_exhausted: false,
+                },
+                is_current: false,
+            },
+        ],
+    });
+
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("");
+    assert!(rendered.contains("Current account: primary"));
+    assert!(rendered.contains("当前"));
+    assert!(rendered.contains("别名"));
+    assert!(rendered.contains("账号"));
+    assert!(rendered.contains("5h额度"));
+    assert!(rendered.contains("周额度"));
+    assert!(rendered.contains("更新时间"));
+    assert!(rendered.contains("是"));
+    assert!(rendered.contains("primary"));
+    assert!(rendered.contains("80% 剩余"));
+    assert!(rendered.contains("one@example.com"));
+    assert!(rendered.contains("backup"));
+}
+
+#[tokio::test]
 async fn slash_copy_state_tracks_turn_complete_final_reply() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 

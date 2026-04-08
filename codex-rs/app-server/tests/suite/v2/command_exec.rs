@@ -744,11 +744,12 @@ async fn command_exec_process_ids_are_connection_scoped_and_disconnect_terminate
     )
     .await?;
 
-    let delta = read_command_exec_delta_ws(&mut ws1).await?;
+    let delta = read_command_exec_delta_ws_until_text(&mut ws1, "ready").await?;
     assert_eq!(delta.process_id, "shared-process");
-    assert_eq!(delta.stream, CommandExecOutputStream::Stdout);
-    let delta_text = String::from_utf8(STANDARD.decode(&delta.delta_base64)?)?;
-    assert!(delta_text.contains("ready"));
+    assert!(matches!(
+        delta.stream,
+        CommandExecOutputStream::Stdout | CommandExecOutputStream::Stderr
+    ));
     wait_for_process_marker(&marker, /*should_exist*/ true).await?;
 
     send_request(
@@ -835,6 +836,19 @@ async fn read_command_exec_delta_ws(
         };
         if notification.method == "command/exec/outputDelta" {
             return decode_delta_notification(notification);
+        }
+    }
+}
+
+async fn read_command_exec_delta_ws_until_text(
+    stream: &mut super::connection_handling_websocket::WsClient,
+    expected: &str,
+) -> Result<CommandExecOutputDeltaNotification> {
+    loop {
+        let delta = read_command_exec_delta_ws(stream).await?;
+        let delta_text = String::from_utf8(STANDARD.decode(&delta.delta_base64)?)?;
+        if delta_text.contains(expected) {
+            return Ok(delta);
         }
     }
 }

@@ -1743,6 +1743,115 @@ pub struct GetAccountResponse {
     pub requires_openai_auth: bool,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum AccountPoolSource {
+    Native,
+    CodexAccImport,
+    CcSwitchImport,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolTokenHealth {
+    pub refresh_status: Option<String>,
+    pub needs_relogin: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolUsageHealth {
+    pub five_hour_remaining_percent: Option<u8>,
+    pub five_hour_resets_at: Option<i64>,
+    pub weekly_remaining_percent: Option<u8>,
+    pub weekly_resets_at: Option<i64>,
+    pub last_checked_at: Option<i64>,
+    pub quota_exhausted: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolAccount {
+    pub alias: String,
+    pub source: AccountPoolSource,
+    pub email: Option<String>,
+    pub plan_type: Option<String>,
+    pub token_health: AccountPoolTokenHealth,
+    pub usage_health: AccountPoolUsageHealth,
+    pub is_current: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolListParams {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolListResponse {
+    pub current_alias: Option<String>,
+    pub accounts: Vec<AccountPoolAccount>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum AccountPoolImportSourceKind {
+    CodexAcc,
+    CcSwitch,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolImportParams {
+    pub source: AccountPoolImportSourceKind,
+    #[ts(optional = nullable)]
+    pub path: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolImportResponse {
+    pub imported_aliases: Vec<String>,
+    pub skipped_aliases: Vec<String>,
+    pub current_alias: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolSwitchParams {
+    pub alias: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolSwitchResponse {
+    pub current_alias: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolSwitchNextParams {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolSwitchNextResponse {
+    pub current_alias: Option<String>,
+    pub switched: bool,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]

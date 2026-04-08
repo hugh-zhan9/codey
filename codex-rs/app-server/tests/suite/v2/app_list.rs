@@ -11,6 +11,7 @@ use app_test_support::ChatGptAuthFixture;
 use app_test_support::McpProcess;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
+use app_test_support::write_models_cache;
 use axum::Json;
 use axum::Router;
 use axum::extract::State;
@@ -179,6 +180,7 @@ async fn list_apps_uses_thread_feature_flag_when_thread_id_is_provided() -> Resu
             .chatgpt_account_id("account-123"),
         AuthCredentialsStoreMode::File,
     )?;
+    write_models_cache(codex_home.path())?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;

@@ -10,6 +10,9 @@
 
 use std::path::PathBuf;
 
+use codex_app_server_protocol::AccountPoolImportResponse;
+use codex_app_server_protocol::AccountPoolImportSourceKind;
+use codex_app_server_protocol::AccountPoolListResponse;
 use codex_app_server_protocol::McpServerStatus;
 use codex_app_server_protocol::PluginInstallResponse;
 use codex_app_server_protocol::PluginListResponse;
@@ -154,6 +157,51 @@ pub(crate) enum AppEvent {
     /// Result of reloading account state.
     AccountReloaded {
         result: Result<ReloadedAccountState, String>,
+    },
+
+    /// Switch to the next healthy pooled account, if any.
+    AutoSwitchAccount,
+
+    /// Result of auto-switching to the next pooled account.
+    AccountAutoSwitched {
+        result: Result<Option<ReloadedAccountState>, String>,
+    },
+
+    /// List current account-pool entries.
+    FetchAccountPoolList,
+
+    /// Result of listing current account-pool entries.
+    AccountPoolLoaded {
+        result: Result<AccountPoolListResponse, String>,
+    },
+
+    /// Import account-pool entries from an external source.
+    ImportAccountPool {
+        source: AccountPoolImportSourceKind,
+        path: Option<String>,
+    },
+
+    /// Result of importing account-pool entries.
+    AccountPoolImported {
+        result: Result<AccountPoolImportResponse, String>,
+    },
+
+    /// Switch to the specified pooled account alias.
+    SwitchAccountPool {
+        alias: String,
+    },
+
+    /// Result of switching to the specified pooled account alias.
+    AccountPoolSwitched {
+        result: Result<ReloadedAccountState, String>,
+    },
+
+    /// Manually switch to the next healthy pooled account.
+    SwitchNextAccountPool,
+
+    /// Result of manually switching to the next healthy pooled account.
+    NextAccountPoolSwitched {
+        result: Result<Option<ReloadedAccountState>, String>,
     },
 
     /// Refresh account rate limits in the background.

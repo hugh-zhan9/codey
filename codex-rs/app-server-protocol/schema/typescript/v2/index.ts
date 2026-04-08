@@ -2,6 +2,19 @@
 
 export type { Account } from "./Account";
 export type { AccountLoginCompletedNotification } from "./AccountLoginCompletedNotification";
+export type { AccountPoolAccount } from "./AccountPoolAccount";
+export type { AccountPoolImportParams } from "./AccountPoolImportParams";
+export type { AccountPoolImportResponse } from "./AccountPoolImportResponse";
+export type { AccountPoolImportSourceKind } from "./AccountPoolImportSourceKind";
+export type { AccountPoolListParams } from "./AccountPoolListParams";
+export type { AccountPoolListResponse } from "./AccountPoolListResponse";
+export type { AccountPoolSource } from "./AccountPoolSource";
+export type { AccountPoolSwitchNextParams } from "./AccountPoolSwitchNextParams";
+export type { AccountPoolSwitchNextResponse } from "./AccountPoolSwitchNextResponse";
+export type { AccountPoolSwitchParams } from "./AccountPoolSwitchParams";
+export type { AccountPoolSwitchResponse } from "./AccountPoolSwitchResponse";
+export type { AccountPoolTokenHealth } from "./AccountPoolTokenHealth";
+export type { AccountPoolUsageHealth } from "./AccountPoolUsageHealth";
 export type { AccountRateLimitsUpdatedNotification } from "./AccountRateLimitsUpdatedNotification";
 export type { AccountUpdatedNotification } from "./AccountUpdatedNotification";
 export type { AdditionalFileSystemPermissions } from "./AdditionalFileSystemPermissions";

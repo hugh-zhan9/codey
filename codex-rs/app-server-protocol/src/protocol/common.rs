@@ -480,6 +480,26 @@ client_request_definitions! {
         response: v2::CancelLoginAccountResponse,
     },
 
+    AccountPoolList => "accountPool/list" {
+        params: v2::AccountPoolListParams,
+        response: v2::AccountPoolListResponse,
+    },
+
+    AccountPoolImport => "accountPool/import" {
+        params: v2::AccountPoolImportParams,
+        response: v2::AccountPoolImportResponse,
+    },
+
+    AccountPoolSwitch => "accountPool/switch" {
+        params: v2::AccountPoolSwitchParams,
+        response: v2::AccountPoolSwitchResponse,
+    },
+
+    AccountPoolSwitchNext => "accountPool/switchNext" {
+        params: v2::AccountPoolSwitchNextParams,
+        response: v2::AccountPoolSwitchNextResponse,
+    },
+
     LogoutAccount => "account/logout" {
         params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
         response: v2::LogoutAccountResponse,

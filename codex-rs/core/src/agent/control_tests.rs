@@ -492,7 +492,7 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
 }
 
 #[tokio::test]
-async fn append_message_records_assistant_message() {
+async fn append_message_keeps_assistant_message_pending() {
     let harness = AgentControlHarness::new().await;
     let (thread_id, thread) = harness.start_thread().await;
     let message =
@@ -518,32 +518,38 @@ async fn append_message_records_assistant_message() {
 
     timeout(Duration::from_secs(5), async {
         loop {
-            let history_items = thread
-                .codex
-                .session
-                .clone_history()
-                .await
-                .raw_items()
-                .to_vec();
-            let recorded = history_items.iter().any(|item| {
-                matches!(
-                    item,
-                    ResponseItem::Message { role, content, .. }
-                        if role == "assistant"
-                            && content.iter().any(|content_item| matches!(
-                                content_item,
-                                ContentItem::InputText { text } if text == message
-                            ))
-                )
-            });
-            if recorded {
+            if thread.codex.session.has_pending_input().await {
                 break;
             }
             sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("assistant message should be recorded");
+    .expect("assistant message should stay pending");
+
+    let history_items = thread
+        .codex
+        .session
+        .clone_history()
+        .await
+        .raw_items()
+        .to_vec();
+    let recorded = history_items.iter().any(|item| {
+        matches!(
+            item,
+            ResponseItem::Message { role, content, .. }
+                if role == "assistant"
+                    && content.iter().any(|content_item| matches!(
+                        content_item,
+                        ContentItem::InputText { text } | ContentItem::OutputText { text }
+                            if text == message
+                    ))
+        )
+    });
+    assert!(
+        !recorded,
+        "assistant message should not be recorded in history yet"
+    );
 }
 
 #[tokio::test]

@@ -1,0 +1,28 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AccountPoolImportSourceKind": {
+      "enum": [
+        "codexAcc",
+        "ccSwitch"
+      ],
+      "type": "string"
+    }
+  },
+  "properties": {
+    "path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source": {
+      "$ref": "#/definitions/AccountPoolImportSourceKind"
+    }
+  },
+  "required": [
+    "source"
+  ],
+  "title": "AccountPoolImportParams",
+  "type": "object"
+}

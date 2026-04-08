@@ -59,6 +59,15 @@ use codex_ansi_escape::ansi_escape_line;
 use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::Account;
+use codex_app_server_protocol::AccountPoolImportParams;
+use codex_app_server_protocol::AccountPoolImportResponse;
+use codex_app_server_protocol::AccountPoolImportSourceKind;
+use codex_app_server_protocol::AccountPoolListParams;
+use codex_app_server_protocol::AccountPoolListResponse;
+use codex_app_server_protocol::AccountPoolSwitchNextParams;
+use codex_app_server_protocol::AccountPoolSwitchNextResponse;
+use codex_app_server_protocol::AccountPoolSwitchParams;
+use codex_app_server_protocol::AccountPoolSwitchResponse;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::CodexErrorInfo as AppServerCodexErrorInfo;
 use codex_app_server_protocol::ConfigLayerSource;
@@ -1913,10 +1922,74 @@ impl App {
         let request_handle = app_server.request_handle();
         let app_event_tx = self.app_event_tx.clone();
         tokio::spawn(async move {
-            let result = fetch_reloaded_account_state(request_handle)
+            let result = fetch_reloaded_account_state(request_handle, /*do_refresh*/ false)
                 .await
                 .map_err(|err| err.to_string());
             app_event_tx.send(AppEvent::AccountReloaded { result });
+        });
+    }
+
+    fn auto_switch_account(&mut self, app_server: &AppServerSession) {
+        let request_handle = app_server.request_handle();
+        let app_event_tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let result = fetch_auto_switched_account_state(request_handle)
+                .await
+                .map_err(|err| err.to_string());
+            app_event_tx.send(AppEvent::AccountAutoSwitched { result });
+        });
+    }
+
+    fn fetch_account_pool_list(&mut self, app_server: &AppServerSession) {
+        self.chat_widget.add_info_message(
+            "Refreshing account pool usage data. This may take a while...".to_string(),
+            /*hint*/ None,
+        );
+        let request_handle = app_server.request_handle();
+        let app_event_tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let result = fetch_account_pool_list(request_handle)
+                .await
+                .map_err(|err| err.to_string());
+            app_event_tx.send(AppEvent::AccountPoolLoaded { result });
+        });
+    }
+
+    fn import_account_pool(
+        &mut self,
+        app_server: &AppServerSession,
+        source: AccountPoolImportSourceKind,
+        path: Option<String>,
+    ) {
+        let request_handle = app_server.request_handle();
+        let app_event_tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let result = import_account_pool(request_handle, source, path)
+                .await
+                .map_err(|err| err.to_string());
+            app_event_tx.send(AppEvent::AccountPoolImported { result });
+        });
+    }
+
+    fn switch_account_pool(&mut self, app_server: &AppServerSession, alias: String) {
+        let request_handle = app_server.request_handle();
+        let app_event_tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let result = switch_account_pool(request_handle, alias)
+                .await
+                .map_err(|err| err.to_string());
+            app_event_tx.send(AppEvent::AccountPoolSwitched { result });
+        });
+    }
+
+    fn switch_next_account_pool(&mut self, app_server: &AppServerSession) {
+        let request_handle = app_server.request_handle();
+        let app_event_tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let result = fetch_auto_switched_account_state(request_handle)
+                .await
+                .map_err(|err| err.to_string());
+            app_event_tx.send(AppEvent::NextAccountPoolSwitched { result });
         });
     }
 
@@ -4462,6 +4535,60 @@ impl App {
                         .add_error_message(format!("Failed to reload auth state: {err}"));
                 }
             },
+            AppEvent::AutoSwitchAccount => {
+                self.auto_switch_account(app_server);
+            }
+            AppEvent::AccountAutoSwitched { result } => match result {
+                Ok(Some(state)) => {
+                    self.chat_widget.on_account_reloaded(state);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!("accountPool/switchNext failed during TUI auto-switch: {err}");
+                    self.chat_widget
+                        .add_error_message(format!("Failed to switch account: {err}"));
+                }
+            },
+            AppEvent::FetchAccountPoolList => {
+                self.fetch_account_pool_list(app_server);
+            }
+            AppEvent::AccountPoolLoaded { result } => match result {
+                Ok(response) => self.chat_widget.on_account_pool_loaded(response),
+                Err(err) => self
+                    .chat_widget
+                    .add_error_message(format!("Failed to load account pool: {err}")),
+            },
+            AppEvent::ImportAccountPool { source, path } => {
+                self.import_account_pool(app_server, source, path);
+            }
+            AppEvent::AccountPoolImported { result } => match result {
+                Ok(response) => self.chat_widget.on_account_pool_imported(response),
+                Err(err) => self
+                    .chat_widget
+                    .add_error_message(format!("Failed to import account pool: {err}")),
+            },
+            AppEvent::SwitchAccountPool { alias } => {
+                self.switch_account_pool(app_server, alias);
+            }
+            AppEvent::AccountPoolSwitched { result } => match result {
+                Ok(state) => self.chat_widget.on_account_reloaded(state),
+                Err(err) => self
+                    .chat_widget
+                    .add_error_message(format!("Failed to switch account: {err}")),
+            },
+            AppEvent::SwitchNextAccountPool => {
+                self.switch_next_account_pool(app_server);
+            }
+            AppEvent::NextAccountPoolSwitched { result } => match result {
+                Ok(Some(state)) => self.chat_widget.on_account_reloaded(state),
+                Ok(None) => self.chat_widget.add_info_message(
+                    "No healthy backup account is available to switch to.".to_string(),
+                    /*hint*/ None,
+                ),
+                Err(err) => self
+                    .chat_widget
+                    .add_error_message(format!("Failed to switch account: {err}")),
+            },
             AppEvent::RefreshRateLimits { request_id } => {
                 self.refresh_rate_limits(app_server, request_id);
             }
@@ -6088,13 +6215,14 @@ async fn fetch_account_rate_limits(
 
 async fn fetch_reloaded_account_state(
     request_handle: AppServerRequestHandle,
+    do_refresh: bool,
 ) -> Result<ReloadedAccountState> {
     let request_id = RequestId::String(format!("account-read-{}", Uuid::new_v4()));
     let response: GetAccountResponse = request_handle
         .request_typed(ClientRequest::GetAccount {
             request_id,
             params: GetAccountParams {
-                refresh_token: false,
+                refresh_token: do_refresh,
             },
         })
         .await
@@ -6152,6 +6280,80 @@ async fn fetch_reloaded_account_state(
         message,
         hint,
     })
+}
+
+async fn fetch_account_pool_list(
+    request_handle: AppServerRequestHandle,
+) -> Result<AccountPoolListResponse> {
+    let request_id = RequestId::String(format!("account-pool-list-{}", Uuid::new_v4()));
+    request_handle
+        .request_typed(ClientRequest::AccountPoolList {
+            request_id,
+            params: AccountPoolListParams {},
+        })
+        .await
+        .wrap_err("accountPool/list failed in TUI")
+}
+
+async fn import_account_pool(
+    request_handle: AppServerRequestHandle,
+    source: AccountPoolImportSourceKind,
+    path: Option<String>,
+) -> Result<AccountPoolImportResponse> {
+    let request_id = RequestId::String(format!("account-pool-import-{}", Uuid::new_v4()));
+    request_handle
+        .request_typed(ClientRequest::AccountPoolImport {
+            request_id,
+            params: AccountPoolImportParams { source, path },
+        })
+        .await
+        .wrap_err("accountPool/import failed in TUI")
+}
+
+async fn switch_account_pool(
+    request_handle: AppServerRequestHandle,
+    alias: String,
+) -> Result<ReloadedAccountState> {
+    let request_id = RequestId::String(format!("account-pool-switch-{}", Uuid::new_v4()));
+    let response: AccountPoolSwitchResponse = request_handle
+        .request_typed(ClientRequest::AccountPoolSwitch {
+            request_id,
+            params: AccountPoolSwitchParams {
+                alias: alias.clone(),
+            },
+        })
+        .await
+        .wrap_err("accountPool/switch failed in TUI")?;
+    let mut reloaded = fetch_reloaded_account_state(request_handle, /*do_refresh*/ true).await?;
+    reloaded.message = match response.current_alias {
+        Some(current_alias) => {
+            format!("Switched to account `{current_alias}` and reloaded auth state.")
+        }
+        None => format!("Switched to account `{alias}` and reloaded auth state."),
+    };
+    Ok(reloaded)
+}
+
+async fn fetch_auto_switched_account_state(
+    request_handle: AppServerRequestHandle,
+) -> Result<Option<ReloadedAccountState>> {
+    let request_id = RequestId::String(format!("account-pool-switch-next-{}", Uuid::new_v4()));
+    let response: AccountPoolSwitchNextResponse = request_handle
+        .request_typed(ClientRequest::AccountPoolSwitchNext {
+            request_id,
+            params: AccountPoolSwitchNextParams {},
+        })
+        .await
+        .wrap_err("accountPool/switchNext failed in TUI")?;
+    if !response.switched {
+        return Ok(None);
+    }
+    let mut reloaded = fetch_reloaded_account_state(request_handle, /*do_refresh*/ true).await?;
+    reloaded.message = match response.current_alias {
+        Some(alias) => format!("Switched to backup account `{alias}` and reloaded auth state."),
+        None => "Switched to backup account and reloaded auth state.".to_string(),
+    };
+    Ok(Some(reloaded))
 }
 
 async fn fetch_plugins_list(

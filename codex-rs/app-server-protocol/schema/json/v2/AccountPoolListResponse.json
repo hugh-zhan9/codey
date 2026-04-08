@@ -1,0 +1,115 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AccountPoolAccount": {
+      "properties": {
+        "alias": {
+          "type": "string"
+        },
+        "email": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "isCurrent": {
+          "type": "boolean"
+        },
+        "planType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/definitions/AccountPoolSource"
+        },
+        "tokenHealth": {
+          "$ref": "#/definitions/AccountPoolTokenHealth"
+        },
+        "usageHealth": {
+          "$ref": "#/definitions/AccountPoolUsageHealth"
+        }
+      },
+      "required": [
+        "alias",
+        "isCurrent",
+        "source",
+        "tokenHealth",
+        "usageHealth"
+      ],
+      "type": "object"
+    },
+    "AccountPoolSource": {
+      "enum": [
+        "native",
+        "codexAccImport",
+        "ccSwitchImport"
+      ],
+      "type": "string"
+    },
+    "AccountPoolTokenHealth": {
+      "properties": {
+        "needsRelogin": {
+          "type": "boolean"
+        },
+        "refreshStatus": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "needsRelogin"
+      ],
+      "type": "object"
+    },
+    "AccountPoolUsageHealth": {
+      "properties": {
+        "fiveHourRemainingPercent": {
+          "format": "uint8",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "quotaExhausted": {
+          "type": "boolean"
+        },
+        "weeklyRemainingPercent": {
+          "format": "uint8",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "quotaExhausted"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "accounts": {
+      "items": {
+        "$ref": "#/definitions/AccountPoolAccount"
+      },
+      "type": "array"
+    },
+    "currentAlias": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "accounts"
+  ],
+  "title": "AccountPoolListResponse",
+  "type": "object"
+}

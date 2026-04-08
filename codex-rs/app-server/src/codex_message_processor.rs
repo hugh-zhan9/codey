@@ -23,6 +23,15 @@ use chrono::Utc;
 use codex_analytics::AnalyticsEventsClient;
 use codex_app_server_protocol::Account;
 use codex_app_server_protocol::AccountLoginCompletedNotification;
+use codex_app_server_protocol::AccountPoolImportParams;
+use codex_app_server_protocol::AccountPoolImportResponse;
+use codex_app_server_protocol::AccountPoolImportSourceKind;
+use codex_app_server_protocol::AccountPoolListParams;
+use codex_app_server_protocol::AccountPoolListResponse;
+use codex_app_server_protocol::AccountPoolSwitchNextParams;
+use codex_app_server_protocol::AccountPoolSwitchNextResponse;
+use codex_app_server_protocol::AccountPoolSwitchParams;
+use codex_app_server_protocol::AccountPoolSwitchResponse;
 use codex_app_server_protocol::AccountUpdatedNotification;
 use codex_app_server_protocol::AppInfo;
 use codex_app_server_protocol::AppsListParams;
@@ -185,6 +194,7 @@ use codex_arg0::Arg0DispatchPaths;
 use codex_backend_client::Client as BackendClient;
 use codex_chatgpt::connectors;
 use codex_cloud_requirements::cloud_requirements_loader;
+use codex_config::types::AuthCredentialsStoreMode;
 use codex_config::types::McpServerTransportConfig;
 use codex_core::CodexThread;
 use codex_core::Cursor as RolloutCursor;
@@ -242,12 +252,16 @@ use codex_login::CLIENT_ID;
 use codex_login::CodexAuth;
 use codex_login::ServerOptions as LoginServerOptions;
 use codex_login::ShutdownHandle;
+use codex_login::account_pool::AccountPoolManager;
 use codex_login::auth::login_with_chatgpt_auth_tokens;
 use codex_login::complete_device_code_login;
 use codex_login::default_client::set_default_client_residency_requirement;
+use codex_login::load_auth_dot_json;
 use codex_login::login_with_api_key;
 use codex_login::request_device_code;
 use codex_login::run_login_server;
+use codex_login::save_auth;
+use codex_login::token_data::parse_jwt_expiration;
 use codex_mcp::mcp::McpSnapshotDetail;
 use codex_mcp::mcp::auth::discover_supported_scopes;
 use codex_mcp::mcp::auth::resolve_oauth_scopes;
@@ -298,6 +312,8 @@ use codex_state::log_db::LogDbLayer;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_json_to_toml::json_to_toml;
 use codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP;
+use futures::StreamExt;
+use futures::stream;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -313,6 +329,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::SystemTime;
+use tempfile::tempdir;
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 use tokio::sync::oneshot;
@@ -461,6 +478,12 @@ enum RefreshTokenRequestOutcome {
     NotAttemptedOrSucceeded,
     FailedTransiently,
     FailedPermanently,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RefreshTokenRequestPolicy {
+    IfNearExpiry,
+    Force,
 }
 
 pub(crate) struct CodexMessageProcessorArgs {
@@ -906,6 +929,22 @@ impl CodexMessageProcessor {
                 self.cancel_login_v2(to_connection_request_id(request_id), params)
                     .await;
             }
+            ClientRequest::AccountPoolList { request_id, params } => {
+                self.account_pool_list(to_connection_request_id(request_id), params)
+                    .await;
+            }
+            ClientRequest::AccountPoolImport { request_id, params } => {
+                self.account_pool_import(to_connection_request_id(request_id), params)
+                    .await;
+            }
+            ClientRequest::AccountPoolSwitch { request_id, params } => {
+                self.account_pool_switch(to_connection_request_id(request_id), params)
+                    .await;
+            }
+            ClientRequest::AccountPoolSwitchNext { request_id, params } => {
+                self.account_pool_switch_next(to_connection_request_id(request_id), params)
+                    .await;
+            }
             ClientRequest::GetAccount { request_id, params } => {
                 self.get_account(to_connection_request_id(request_id), params)
                     .await;
@@ -1059,6 +1098,7 @@ impl CodexMessageProcessor {
         ) {
             Ok(()) => {
                 self.auth_manager.reload();
+                let _ = self.account_pool_manager().clear_current_alias();
                 Ok(())
             }
             Err(err) => Err(JSONRPCErrorError {
@@ -1182,6 +1222,7 @@ impl CodexMessageProcessor {
                     let cloud_requirements = self.cloud_requirements.clone();
                     let chatgpt_base_url = self.config.chatgpt_base_url.clone();
                     let codex_home = self.config.codex_home.clone();
+                    let auth_credentials_store_mode = self.config.cli_auth_credentials_store_mode;
                     let cli_overrides = self.current_cli_overrides();
                     let auth_url = server.auth_url.clone();
                     tokio::spawn(async move {
@@ -1216,13 +1257,19 @@ impl CodexMessageProcessor {
                                 cloud_requirements.as_ref(),
                                 auth_manager.clone(),
                                 chatgpt_base_url,
-                                codex_home,
+                                codex_home.clone(),
                             );
                             sync_default_client_residency_requirement(
                                 &cli_overrides,
                                 cloud_requirements.as_ref(),
                             )
                             .await;
+                            AccountPoolManager::new(
+                                codex_home.clone(),
+                                auth_credentials_store_mode,
+                            )
+                            .sync_active_auth(None)
+                            .ok();
 
                             // Notify clients with the actual current auth mode.
                             let auth = auth_manager.auth_cached();
@@ -1299,6 +1346,7 @@ impl CodexMessageProcessor {
                     let cloud_requirements = self.cloud_requirements.clone();
                     let chatgpt_base_url = self.config.chatgpt_base_url.clone();
                     let codex_home = self.config.codex_home.clone();
+                    let auth_credentials_store_mode = self.config.cli_auth_credentials_store_mode;
                     let cli_overrides = self.current_cli_overrides();
                     tokio::spawn(async move {
                         let (success, error_msg) = tokio::select! {
@@ -1330,13 +1378,19 @@ impl CodexMessageProcessor {
                                 cloud_requirements.as_ref(),
                                 auth_manager.clone(),
                                 chatgpt_base_url,
-                                codex_home,
+                                codex_home.clone(),
                             );
                             sync_default_client_residency_requirement(
                                 &cli_overrides,
                                 cloud_requirements.as_ref(),
                             )
                             .await;
+                            AccountPoolManager::new(
+                                codex_home.clone(),
+                                auth_credentials_store_mode,
+                            )
+                            .sync_active_auth(None)
+                            .ok();
 
                             let auth = auth_manager.auth_cached();
                             let payload_v2 = AccountUpdatedNotification {
@@ -1465,16 +1519,8 @@ impl CodexMessageProcessor {
             self.outgoing.send_error(request_id, error).await;
             return;
         }
-        self.auth_manager.reload();
-        replace_cloud_requirements_loader(
-            self.cloud_requirements.as_ref(),
-            self.auth_manager.clone(),
-            self.config.chatgpt_base_url.clone(),
-            self.config.codex_home.clone(),
-        );
-        let cli_overrides = self.current_cli_overrides();
-        sync_default_client_residency_requirement(&cli_overrides, self.cloud_requirements.as_ref())
-            .await;
+        self.reload_auth_runtime_state().await;
+        let _ = self.account_pool_manager().clear_current_alias();
 
         self.outgoing
             .send_response(request_id, LoginAccountResponse::ChatgptAuthTokens {})
@@ -1514,6 +1560,7 @@ impl CodexMessageProcessor {
                 data: None,
             });
         }
+        let _ = self.account_pool_manager().clear_current_alias();
 
         // Reflect the current auth method after logout (likely None).
         Ok(self
@@ -1544,11 +1591,395 @@ impl CodexMessageProcessor {
         }
     }
 
-    async fn refresh_token_if_requested(&self, do_refresh: bool) -> RefreshTokenRequestOutcome {
+    async fn account_pool_list(
+        &self,
+        request_id: ConnectionRequestId,
+        _params: AccountPoolListParams,
+    ) {
+        let manager = self.account_pool_manager();
+        self.refresh_all_account_pool_health(&manager).await;
+        match manager.load() {
+            Ok(account_pool) => {
+                let current_alias = account_pool.current_alias.clone();
+                let response = AccountPoolListResponse {
+                    current_alias: current_alias.clone(),
+                    accounts: account_pool
+                        .accounts
+                        .into_iter()
+                        .map(|account| codex_app_server_protocol::AccountPoolAccount {
+                            alias: account.alias.clone(),
+                            source: match account.source {
+                                codex_login::account_pool::AccountPoolSource::Native => {
+                                    codex_app_server_protocol::AccountPoolSource::Native
+                                }
+                                codex_login::account_pool::AccountPoolSource::CodexAccImport => {
+                                    codex_app_server_protocol::AccountPoolSource::CodexAccImport
+                                }
+                                codex_login::account_pool::AccountPoolSource::CcSwitchImport => {
+                                    codex_app_server_protocol::AccountPoolSource::CcSwitchImport
+                                }
+                            },
+                            email: account.account_identity.email,
+                            plan_type: account.account_identity.plan_type,
+                            token_health: codex_app_server_protocol::AccountPoolTokenHealth {
+                                refresh_status: account.token_health.refresh_status,
+                                needs_relogin: account.token_health.needs_relogin,
+                            },
+                            usage_health: codex_app_server_protocol::AccountPoolUsageHealth {
+                                five_hour_remaining_percent: account
+                                    .usage_health
+                                    .five_hour_remaining_percent,
+                                five_hour_resets_at: account.usage_health.five_hour_resets_at,
+                                weekly_remaining_percent: account
+                                    .usage_health
+                                    .weekly_remaining_percent,
+                                weekly_resets_at: account.usage_health.weekly_resets_at,
+                                last_checked_at: account
+                                    .usage_health
+                                    .last_checked_at
+                                    .map(|value| value.timestamp()),
+                                quota_exhausted: account.usage_health.quota_exhausted,
+                            },
+                            is_current: current_alias.as_deref() == Some(account.alias.as_str()),
+                        })
+                        .collect(),
+                };
+                self.outgoing.send_response(request_id, response).await;
+            }
+            Err(err) => {
+                self.send_internal_error(request_id, format!("failed to list account pool: {err}"))
+                    .await;
+            }
+        }
+    }
+
+    async fn account_pool_import(
+        &self,
+        request_id: ConnectionRequestId,
+        params: AccountPoolImportParams,
+    ) {
+        let manager = self.account_pool_manager();
+        let result = match params.source {
+            AccountPoolImportSourceKind::CodexAcc => {
+                let path = params
+                    .path
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| self.config.codex_home.join("codex-cc.json"));
+                manager.import_codex_acc_store(&path)
+            }
+            AccountPoolImportSourceKind::CcSwitch => {
+                let path = params.path.map(PathBuf::from).unwrap_or_else(|| {
+                    self.config
+                        .codex_home
+                        .parent()
+                        .unwrap_or(self.config.codex_home.as_path())
+                        .join(".cc-switch")
+                        .join("cc-switch.db")
+                });
+                manager.import_cc_switch_db(&path).await
+            }
+        };
+        match result {
+            Ok(result) => {
+                let current_alias = manager.load().ok().and_then(|pool| pool.current_alias);
+                self.outgoing
+                    .send_response(
+                        request_id,
+                        AccountPoolImportResponse {
+                            imported_aliases: result.imported_aliases,
+                            skipped_aliases: result.skipped_aliases,
+                            current_alias,
+                        },
+                    )
+                    .await;
+            }
+            Err(err) => {
+                self.send_internal_error(
+                    request_id,
+                    format!("failed to import account pool entries: {err}"),
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn account_pool_switch(
+        &self,
+        request_id: ConnectionRequestId,
+        params: AccountPoolSwitchParams,
+    ) {
+        let manager = self.account_pool_manager();
+        match manager.activate_account(&params.alias) {
+            Ok(account_pool) => {
+                self.reload_auth_runtime_state().await;
+                self.sync_active_auth_into_account_pool(account_pool.current_alias.as_deref());
+                self.outgoing
+                    .send_response(
+                        request_id,
+                        AccountPoolSwitchResponse {
+                            current_alias: account_pool.current_alias,
+                        },
+                    )
+                    .await;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                self.send_invalid_request_error(
+                    request_id,
+                    format!("account alias `{}` was not found", params.alias),
+                )
+                .await;
+            }
+            Err(err) => {
+                self.send_internal_error(
+                    request_id,
+                    format!("failed to switch account pool entry: {err}"),
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn account_pool_switch_next(
+        &self,
+        request_id: ConnectionRequestId,
+        _params: AccountPoolSwitchNextParams,
+    ) {
+        let manager = self.account_pool_manager();
+        let current_alias = match manager.load() {
+            Ok(pool) => pool.current_alias,
+            Err(err) => {
+                self.send_internal_error(request_id, format!("failed to load account pool: {err}"))
+                    .await;
+                return;
+            }
+        };
+        let Some(current_alias) = current_alias else {
+            self.outgoing
+                .send_response(
+                    request_id,
+                    AccountPoolSwitchNextResponse {
+                        current_alias: None,
+                        switched: false,
+                    },
+                )
+                .await;
+            return;
+        };
+        let next_alias = match manager.select_best_switch_target(Some(&current_alias)) {
+            Ok(next_alias) => next_alias,
+            Err(err) => {
+                self.send_internal_error(
+                    request_id,
+                    format!("failed to select account switch target: {err}"),
+                )
+                .await;
+                return;
+            }
+        };
+        let Some(next_alias) = next_alias else {
+            self.outgoing
+                .send_response(
+                    request_id,
+                    AccountPoolSwitchNextResponse {
+                        current_alias: Some(current_alias),
+                        switched: false,
+                    },
+                )
+                .await;
+            return;
+        };
+        match manager.activate_account(&next_alias) {
+            Ok(account_pool) => {
+                self.reload_auth_runtime_state().await;
+                self.sync_active_auth_into_account_pool(account_pool.current_alias.as_deref());
+                self.outgoing
+                    .send_response(
+                        request_id,
+                        AccountPoolSwitchNextResponse {
+                            current_alias: account_pool.current_alias,
+                            switched: true,
+                        },
+                    )
+                    .await;
+            }
+            Err(err) => {
+                self.send_internal_error(
+                    request_id,
+                    format!("failed to switch to next account pool entry: {err}"),
+                )
+                .await;
+            }
+        }
+    }
+
+    fn account_pool_manager(&self) -> AccountPoolManager {
+        AccountPoolManager::new(
+            self.config.codex_home.clone(),
+            self.config.cli_auth_credentials_store_mode,
+        )
+    }
+
+    async fn refresh_all_account_pool_health(&self, manager: &AccountPoolManager) {
+        if self.auth_manager.is_external_chatgpt_auth_active() {
+            return;
+        }
+        let account_pool = match manager.load() {
+            Ok(account_pool) => account_pool,
+            Err(err) => {
+                tracing::warn!("failed to load account pool while refreshing all health: {err}");
+                return;
+            }
+        };
+        const ACCOUNT_POOL_REFRESH_CONCURRENCY: usize = 4;
+        let refreshed_accounts = stream::iter(
+            account_pool
+                .accounts
+                .into_iter()
+                .map(|account| async move { self.refresh_account_pool_account(account).await }),
+        )
+        .buffer_unordered(ACCOUNT_POOL_REFRESH_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+        for refreshed_account in refreshed_accounts {
+            match refreshed_account {
+                Ok(account) => {
+                    if let Err(err) = manager.upsert_account(account, /*make_current*/ false) {
+                        tracing::warn!("failed to persist refreshed pooled account: {err}");
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("failed to refresh pooled account: {err}");
+                }
+            }
+        }
+    }
+
+    async fn refresh_account_pool_account(
+        &self,
+        mut account: codex_login::account_pool::AccountPoolAccount,
+    ) -> std::io::Result<codex_login::account_pool::AccountPoolAccount> {
+        let tempdir = tempdir()?;
+        save_auth(
+            tempdir.path(),
+            &account.auth_snapshot,
+            AuthCredentialsStoreMode::File,
+        )?;
+        let Some(auth) =
+            CodexAuth::from_auth_storage(tempdir.path(), AuthCredentialsStoreMode::File)?
+        else {
+            return Err(std::io::Error::other(
+                "failed to load account snapshot auth",
+            ));
+        };
+        let auth_manager =
+            AuthManager::from_auth_for_testing_with_home(auth, tempdir.path().to_path_buf());
+
+        match Self::refresh_snapshot_auth_if_needed(&auth_manager).await {
+            RefreshTokenRequestOutcome::FailedPermanently => {
+                account.token_health.needs_relogin = true;
+                account.token_health.refresh_status = Some("needs_relogin".to_string());
+                return Ok(account);
+            }
+            RefreshTokenRequestOutcome::FailedTransiently => return Ok(account),
+            RefreshTokenRequestOutcome::NotAttemptedOrSucceeded => {}
+        }
+
+        if let Some(auth_snapshot) =
+            load_auth_dot_json(tempdir.path(), AuthCredentialsStoreMode::File)?
+        {
+            account.token_health.last_refresh_at = auth_snapshot.last_refresh;
+            account.token_health.expires_at = auth_snapshot
+                .tokens
+                .as_ref()
+                .and_then(|tokens| parse_jwt_expiration(&tokens.access_token).ok())
+                .flatten();
+            account.token_health.refresh_status = Some("ok".to_string());
+            account.token_health.needs_relogin = false;
+            account.auth_snapshot = auth_snapshot;
+        }
+
+        let auth = auth_manager.auth().await.ok_or_else(|| {
+            std::io::Error::other("failed to resolve refreshed auth snapshot for account pool")
+        })?;
+        let (primary, _) = self
+            .fetch_account_rate_limits_for_auth(&auth)
+            .await
+            .map_err(|err| std::io::Error::other(err.message))?;
+        let five_hour_remaining_percent = Self::remaining_percent(primary.primary.as_ref());
+        let five_hour_resets_at = Self::resets_at(primary.primary.as_ref());
+        let weekly_remaining_percent = Self::remaining_percent(primary.secondary.as_ref());
+        let weekly_resets_at = Self::resets_at(primary.secondary.as_ref());
+        account.usage_health.five_hour_remaining_percent = five_hour_remaining_percent;
+        account.usage_health.five_hour_resets_at = five_hour_resets_at;
+        account.usage_health.weekly_remaining_percent = weekly_remaining_percent;
+        account.usage_health.weekly_resets_at = weekly_resets_at;
+        account.usage_health.last_checked_at = Some(Utc::now());
+        account.usage_health.quota_exhausted =
+            five_hour_remaining_percent == Some(0) || weekly_remaining_percent == Some(0);
+        Ok(account)
+    }
+
+    async fn refresh_snapshot_auth_if_needed(
+        auth_manager: &Arc<AuthManager>,
+    ) -> RefreshTokenRequestOutcome {
+        match auth_manager.auth().await {
+            Some(_) => RefreshTokenRequestOutcome::NotAttemptedOrSucceeded,
+            None => match auth_manager.refresh_token().await {
+                Ok(()) => RefreshTokenRequestOutcome::NotAttemptedOrSucceeded,
+                Err(err) => {
+                    if err.failed_reason().is_some() {
+                        RefreshTokenRequestOutcome::FailedPermanently
+                    } else {
+                        tracing::warn!(
+                            "failed to refresh token while querying pooled account snapshot: {err}"
+                        );
+                        RefreshTokenRequestOutcome::FailedTransiently
+                    }
+                }
+            },
+        }
+    }
+
+    fn sync_active_auth_into_account_pool(&self, alias: Option<&str>) {
+        if !matches!(
+            self.auth_manager
+                .auth_cached()
+                .as_ref()
+                .map(CodexAuth::auth_mode),
+            Some(CoreAuthMode::Chatgpt)
+        ) {
+            return;
+        }
+        if let Err(err) = self.account_pool_manager().sync_active_auth(alias) {
+            tracing::warn!("failed to sync active auth into account pool: {err}");
+        }
+    }
+
+    async fn reload_auth_runtime_state(&self) {
+        self.auth_manager.reload();
+        replace_cloud_requirements_loader(
+            self.cloud_requirements.as_ref(),
+            self.auth_manager.clone(),
+            self.config.chatgpt_base_url.clone(),
+            self.config.codex_home.clone(),
+        );
+        let cli_overrides = self.current_cli_overrides();
+        sync_default_client_residency_requirement(&cli_overrides, self.cloud_requirements.as_ref())
+            .await;
+    }
+
+    async fn refresh_token_if_requested(
+        &self,
+        policy: RefreshTokenRequestPolicy,
+    ) -> RefreshTokenRequestOutcome {
         if self.auth_manager.is_external_chatgpt_auth_active() {
             return RefreshTokenRequestOutcome::NotAttemptedOrSucceeded;
         }
-        if do_refresh && let Err(err) = self.auth_manager.refresh_token().await {
+        if !self.should_refresh_token(policy) {
+            return RefreshTokenRequestOutcome::NotAttemptedOrSucceeded;
+        }
+        if let Err(err) = self.auth_manager.refresh_token().await {
             let failed_reason = err.failed_reason();
             if failed_reason.is_none() {
                 tracing::warn!("failed to refresh token while getting account: {err}");
@@ -1556,14 +1987,191 @@ impl CodexMessageProcessor {
             }
             return RefreshTokenRequestOutcome::FailedPermanently;
         }
+        self.sync_active_auth_into_account_pool(None);
         RefreshTokenRequestOutcome::NotAttemptedOrSucceeded
+    }
+
+    fn should_refresh_token(&self, policy: RefreshTokenRequestPolicy) -> bool {
+        match policy {
+            RefreshTokenRequestPolicy::Force => true,
+            RefreshTokenRequestPolicy::IfNearExpiry => self
+                .auth_manager
+                .auth_cached()
+                .and_then(|auth| auth.get_token_data().ok())
+                .and_then(|token_data| parse_jwt_expiration(&token_data.access_token).ok())
+                .flatten()
+                .is_some_and(|expires_at| expires_at <= Utc::now() + chrono::Duration::minutes(5)),
+        }
+    }
+
+    async fn maybe_preflight_account_switch(
+        &self,
+        thread: &Arc<CodexThread>,
+        requested_model: Option<&str>,
+        requested_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
+        collaboration_mode: Option<&codex_protocol::config_types::CollaborationMode>,
+        requested_personality: Option<&codex_protocol::config_types::Personality>,
+    ) -> Result<(), JSONRPCErrorError> {
+        if self.auth_manager.is_external_chatgpt_auth_active() {
+            return Ok(());
+        }
+        let Some(auth) = self.auth_manager.auth_cached() else {
+            return Ok(());
+        };
+        if auth.auth_mode() == CoreAuthMode::ApiKey {
+            return Ok(());
+        }
+        let manager = self.account_pool_manager();
+        let account_pool = manager.load().map_err(|err| JSONRPCErrorError {
+            code: INTERNAL_ERROR_CODE,
+            message: format!("failed to load account pool: {err}"),
+            data: None,
+        })?;
+        if account_pool.accounts.len() <= 1 {
+            return Ok(());
+        }
+        let Some(current_alias) = account_pool.current_alias else {
+            return Ok(());
+        };
+
+        let refresh_outcome = self
+            .refresh_token_if_requested(RefreshTokenRequestPolicy::IfNearExpiry)
+            .await;
+        let mut should_switch = matches!(
+            refresh_outcome,
+            RefreshTokenRequestOutcome::FailedPermanently
+        );
+        if should_switch {
+            let _ = manager.mark_account_needs_relogin(&current_alias);
+        }
+
+        if !should_switch && let Ok((primary, _)) = self.fetch_account_rate_limits().await {
+            let five_hour_remaining_percent = Self::remaining_percent(primary.primary.as_ref());
+            let five_hour_resets_at = Self::resets_at(primary.primary.as_ref());
+            let weekly_remaining_percent = Self::remaining_percent(primary.secondary.as_ref());
+            let weekly_resets_at = Self::resets_at(primary.secondary.as_ref());
+            let _ = manager.update_account_usage_health(
+                &current_alias,
+                five_hour_remaining_percent,
+                five_hour_resets_at,
+                weekly_remaining_percent,
+                weekly_resets_at,
+            );
+            should_switch =
+                five_hour_remaining_percent == Some(0) || weekly_remaining_percent == Some(0);
+        }
+
+        if !should_switch {
+            return Ok(());
+        }
+
+        let Some(next_alias) = manager
+            .select_best_switch_target(Some(&current_alias))
+            .map_err(|err| JSONRPCErrorError {
+                code: INTERNAL_ERROR_CODE,
+                message: format!("failed to select account switch target: {err}"),
+                data: None,
+            })?
+        else {
+            return Err(JSONRPCErrorError {
+                code: INVALID_REQUEST_ERROR_CODE,
+                message:
+                    "Current account is exhausted or invalid, and no backup account is available."
+                        .to_string(),
+                data: None,
+            });
+        };
+
+        manager
+            .activate_account(&next_alias)
+            .map_err(|err| JSONRPCErrorError {
+                code: INTERNAL_ERROR_CODE,
+                message: format!("failed to activate backup account: {err}"),
+                data: None,
+            })?;
+        self.reload_auth_runtime_state().await;
+        self.sync_active_auth_into_account_pool(Some(&next_alias));
+        self.validate_switched_account_compatibility(
+            &next_alias,
+            thread,
+            requested_model,
+            requested_effort,
+            collaboration_mode,
+            requested_personality,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn validate_switched_account_compatibility(
+        &self,
+        switched_alias: &str,
+        thread: &Arc<CodexThread>,
+        requested_model: Option<&str>,
+        requested_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
+        collaboration_mode: Option<&codex_protocol::config_types::CollaborationMode>,
+        requested_personality: Option<&codex_protocol::config_types::Personality>,
+    ) -> Result<(), JSONRPCErrorError> {
+        let config_snapshot = thread.config_snapshot().await;
+        let effective_model = collaboration_mode
+            .map(codex_protocol::config_types::CollaborationMode::model)
+            .or(requested_model)
+            .unwrap_or(config_snapshot.model.as_str());
+        let effective_effort = collaboration_mode
+            .and_then(codex_protocol::config_types::CollaborationMode::reasoning_effort)
+            .or(requested_effort)
+            .or(config_snapshot.reasoning_effort);
+        let effective_personality = requested_personality.or(config_snapshot.personality.as_ref());
+        let available_models = supported_models(Arc::clone(&self.thread_manager), false).await;
+        let Some(model) = available_models
+            .iter()
+            .find(|model| model.model == effective_model)
+        else {
+            return Err(JSONRPCErrorError {
+                code: INVALID_REQUEST_ERROR_CODE,
+                message: format!(
+                    "Switched account to `{switched_alias}`, but model `{effective_model}` is unavailable on the new account."
+                ),
+                data: None,
+            });
+        };
+        if let Some(effective_effort) = effective_effort
+            && !model
+                .supported_reasoning_efforts
+                .iter()
+                .any(|option| option.reasoning_effort == effective_effort)
+        {
+            return Err(JSONRPCErrorError {
+                code: INVALID_REQUEST_ERROR_CODE,
+                message: format!(
+                    "Switched account to `{switched_alias}`, but model `{effective_model}` does not support reasoning effort `{effective_effort}`."
+                ),
+                data: None,
+            });
+        }
+        if effective_personality.is_some() && !model.supports_personality {
+            return Err(JSONRPCErrorError {
+                code: INVALID_REQUEST_ERROR_CODE,
+                message: format!(
+                    "Switched account to `{switched_alias}`, but model `{effective_model}` does not support the active personality setting."
+                ),
+                data: None,
+            });
+        }
+        Ok(())
     }
 
     async fn get_auth_status(&self, request_id: ConnectionRequestId, params: GetAuthStatusParams) {
         let include_token = params.include_token.unwrap_or(false);
         let do_refresh = params.refresh_token.unwrap_or(false);
 
-        self.refresh_token_if_requested(do_refresh).await;
+        self.refresh_token_if_requested(if do_refresh {
+            RefreshTokenRequestPolicy::Force
+        } else {
+            RefreshTokenRequestPolicy::IfNearExpiry
+        })
+        .await;
 
         // Determine whether auth is required based on the active model provider.
         // If a custom provider is configured with `requires_openai_auth == false`,
@@ -1623,7 +2231,12 @@ impl CodexMessageProcessor {
     async fn get_account(&self, request_id: ConnectionRequestId, params: GetAccountParams) {
         let do_refresh = params.refresh_token;
 
-        self.refresh_token_if_requested(do_refresh).await;
+        self.refresh_token_if_requested(if do_refresh {
+            RefreshTokenRequestPolicy::Force
+        } else {
+            RefreshTokenRequestPolicy::IfNearExpiry
+        })
+        .await;
 
         // Whether auth is required for the active model provider.
         let requires_openai_auth = self.config.model_provider.requires_openai_auth;
@@ -1717,6 +2330,27 @@ impl CodexMessageProcessor {
             });
         }
 
+        self.fetch_account_rate_limits_for_auth(&auth).await
+    }
+
+    async fn fetch_account_rate_limits_for_auth(
+        &self,
+        auth: &CodexAuth,
+    ) -> Result<
+        (
+            CoreRateLimitSnapshot,
+            HashMap<String, CoreRateLimitSnapshot>,
+        ),
+        JSONRPCErrorError,
+    > {
+        if !auth.is_chatgpt_auth() {
+            return Err(JSONRPCErrorError {
+                code: INVALID_REQUEST_ERROR_CODE,
+                message: "chatgpt authentication required to read rate limits".to_string(),
+                data: None,
+            });
+        }
+
         let client = BackendClient::from_auth(self.config.chatgpt_base_url.clone(), &auth)
             .map_err(|err| JSONRPCErrorError {
                 code: INTERNAL_ERROR_CODE,
@@ -1759,6 +2393,16 @@ impl CodexMessageProcessor {
             .unwrap_or_else(|| snapshots[0].clone());
 
         Ok((primary, rate_limits_by_limit_id))
+    }
+
+    fn remaining_percent(window: Option<&codex_protocol::protocol::RateLimitWindow>) -> Option<u8> {
+        let used_percent = window?.used_percent.round() as i32;
+        let remaining = (100 - used_percent).clamp(0, 100);
+        u8::try_from(remaining).ok()
+    }
+
+    fn resets_at(window: Option<&codex_protocol::protocol::RateLimitWindow>) -> Option<i64> {
+        window.and_then(|window| window.resets_at)
     }
 
     async fn exec_one_off_command(
@@ -6605,6 +7249,20 @@ impl CodexMessageProcessor {
             .into_iter()
             .map(V2UserInput::into_core)
             .collect();
+
+        if let Err(error) = self
+            .maybe_preflight_account_switch(
+                &thread,
+                params.model.as_deref(),
+                params.effort,
+                collaboration_mode.as_ref(),
+                params.personality.as_ref(),
+            )
+            .await
+        {
+            self.outgoing.send_error(request_id, error).await;
+            return;
+        }
 
         let has_any_overrides = params.cwd.is_some()
             || params.approval_policy.is_some()
