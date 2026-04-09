@@ -1767,6 +1767,7 @@ impl CodexMessageProcessor {
                 .await;
             return;
         };
+        self.refresh_all_account_pool_health(&manager).await;
         let next_alias = match manager.select_best_switch_target(Some(&current_alias)) {
             Ok(next_alias) => next_alias,
             Err(err) => {
@@ -2373,12 +2374,13 @@ impl CodexMessageProcessor {
             });
         }
 
-        let client = BackendClient::from_auth(self.config.chatgpt_base_url.clone(), &auth)
-            .map_err(|err| JSONRPCErrorError {
+        let client = BackendClient::from_auth(self.config.chatgpt_base_url.clone(), auth).map_err(
+            |err| JSONRPCErrorError {
                 code: INTERNAL_ERROR_CODE,
                 message: format!("failed to construct backend client: {err}"),
                 data: None,
-            })?;
+            },
+        )?;
 
         let snapshots = client
             .get_rate_limits_many()

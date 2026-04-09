@@ -9,6 +9,7 @@ use app_test_support::encode_id_token;
 use app_test_support::write_chatgpt_auth;
 use app_test_support::write_models_cache;
 use codex_app_server_protocol::Account;
+use codex_app_server_protocol::AccountPoolSwitchNextResponse;
 use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::CancelLoginAccountParams;
 use codex_app_server_protocol::CancelLoginAccountResponse;
@@ -29,6 +30,14 @@ use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnStatus;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_login::account_pool::AccountIdentity;
+use codex_login::account_pool::AccountPoolAccount;
+use codex_login::account_pool::AccountPoolManager;
+use codex_login::account_pool::AccountPoolSource;
+use codex_login::account_pool::SwitchPolicyState;
+use codex_login::account_pool::TokenHealth;
+use codex_login::account_pool::UsageHealth;
+use codex_login::load_auth_dot_json;
 use codex_login::login_with_api_key;
 use codex_protocol::account::PlanType as AccountPlanType;
 use core_test_support::responses;
@@ -42,6 +51,7 @@ use tokio::time::timeout;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
+use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
@@ -100,6 +110,62 @@ stream_max_retries = 0
 "#
     );
     std::fs::write(config_toml, contents)
+}
+
+fn append_chatgpt_base_url(codex_home: &Path, base_url: &str) -> std::io::Result<()> {
+    let config_toml = codex_home.join("config.toml");
+    let contents = std::fs::read_to_string(&config_toml)?;
+    std::fs::write(
+        config_toml,
+        format!("chatgpt_base_url = \"{base_url}\"\n{contents}"),
+    )
+}
+
+fn load_chatgpt_auth_snapshot(
+    codex_home: &Path,
+    fixture: ChatGptAuthFixture,
+) -> Result<codex_login::AuthDotJson> {
+    write_chatgpt_auth(codex_home, fixture, AuthCredentialsStoreMode::File)?;
+    let snapshot = load_auth_dot_json(codex_home, AuthCredentialsStoreMode::File)?
+        .ok_or_else(|| anyhow::anyhow!("chatgpt auth snapshot should be written"))?;
+    Ok(snapshot)
+}
+
+fn pooled_chatgpt_account(
+    alias: &str,
+    auth_snapshot: codex_login::AuthDotJson,
+    email: &str,
+    plan_type: &str,
+    five_hour_remaining_percent: u8,
+    weekly_remaining_percent: u8,
+) -> AccountPoolAccount {
+    AccountPoolAccount {
+        alias: alias.to_string(),
+        auth_snapshot,
+        config_snapshot: None,
+        source: AccountPoolSource::Native,
+        account_identity: AccountIdentity {
+            account_id: Some(format!("org-{alias}")),
+            user_id: Some(format!("user-{alias}")),
+            email: Some(email.to_string()),
+            plan_type: Some(plan_type.to_string()),
+        },
+        token_health: TokenHealth {
+            last_refresh_at: None,
+            expires_at: None,
+            refresh_status: Some("ok".to_string()),
+            needs_relogin: false,
+        },
+        usage_health: UsageHealth {
+            five_hour_remaining_percent: Some(five_hour_remaining_percent),
+            five_hour_resets_at: Some(1_744_300_000),
+            weekly_remaining_percent: Some(weekly_remaining_percent),
+            weekly_resets_at: Some(1_744_900_000),
+            last_checked_at: None,
+            quota_exhausted: five_hour_remaining_percent == 0 || weekly_remaining_percent == 0,
+        },
+        switch_policy_state: SwitchPolicyState::default(),
+    }
 }
 
 async fn mock_device_code_usercode(server: &MockServer, interval_seconds: u64) {
@@ -1628,5 +1694,233 @@ async fn get_account_with_chatgpt_missing_plan_claim_returns_unknown() -> Result
         requires_openai_auth: true,
     };
     assert_eq!(received, expected);
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn account_pool_switch_next_refreshes_accounts_before_selecting_target() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let mock_server = MockServer::start().await;
+    create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
+    append_chatgpt_base_url(codex_home.path(), &mock_server.uri())?;
+
+    let yukun_access_token = encode_id_token(
+        &ChatGptIdTokenClaims::new()
+            .email("yukun@example.com")
+            .plan_type("team")
+            .chatgpt_account_id("org-yukun"),
+    )?;
+    let zhang_access_token = encode_id_token(
+        &ChatGptIdTokenClaims::new()
+            .email("zhang@example.com")
+            .plan_type("team")
+            .chatgpt_account_id("org-zhang"),
+    )?;
+    let connor_access_token = encode_id_token(
+        &ChatGptIdTokenClaims::new()
+            .email("connor@example.com")
+            .plan_type("plus")
+            .chatgpt_account_id("org-connor"),
+    )?;
+
+    let yukun_snapshot = load_chatgpt_auth_snapshot(
+        codex_home.path(),
+        ChatGptAuthFixture::new(yukun_access_token.clone())
+            .email("yukun@example.com")
+            .plan_type("team")
+            .account_id("org-yukun")
+            .chatgpt_account_id("org-yukun"),
+    )?;
+    let zhang_snapshot = load_chatgpt_auth_snapshot(
+        codex_home.path(),
+        ChatGptAuthFixture::new(zhang_access_token.clone())
+            .email("zhang@example.com")
+            .plan_type("team")
+            .account_id("org-zhang")
+            .chatgpt_account_id("org-zhang"),
+    )?;
+    let connor_snapshot = load_chatgpt_auth_snapshot(
+        codex_home.path(),
+        ChatGptAuthFixture::new(connor_access_token.clone())
+            .email("connor@example.com")
+            .plan_type("plus")
+            .account_id("org-connor")
+            .chatgpt_account_id("org-connor"),
+    )?;
+
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new(yukun_access_token.clone())
+            .email("yukun@example.com")
+            .plan_type("team")
+            .account_id("org-yukun")
+            .chatgpt_account_id("org-yukun"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let manager = AccountPoolManager::new(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+    );
+    manager.upsert_account(
+        pooled_chatgpt_account(
+            "yukunzhang",
+            yukun_snapshot,
+            "yukun@example.com",
+            "team",
+            0,
+            53,
+        ),
+        /*make_current*/ true,
+    )?;
+    manager.upsert_account(
+        pooled_chatgpt_account(
+            "zhangyukun",
+            zhang_snapshot,
+            "zhang@example.com",
+            "team",
+            0,
+            64,
+        ),
+        /*make_current*/ false,
+    )?;
+    manager.upsert_account(
+        pooled_chatgpt_account(
+            "connorzhang",
+            connor_snapshot,
+            "connor@example.com",
+            "plus",
+            100,
+            71,
+        ),
+        /*make_current*/ false,
+    )?;
+
+    Mock::given(method("GET"))
+        .and(path("/api/codex/usage"))
+        .and(header(
+            "authorization",
+            format!("Bearer {yukun_access_token}"),
+        ))
+        .and(header("chatgpt-account-id", "org-yukun"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "plan_type": "team",
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": true,
+                "primary_window": {
+                    "used_percent": 100,
+                    "limit_window_seconds": 18000,
+                    "reset_after_seconds": 1800,
+                    "reset_at": 1744200000
+                },
+                "secondary_window": {
+                    "used_percent": 47,
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 86400,
+                    "reset_at": 1744800000
+                }
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/codex/usage"))
+        .and(header(
+            "authorization",
+            format!("Bearer {zhang_access_token}"),
+        ))
+        .and(header("chatgpt-account-id", "org-zhang"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "plan_type": "team",
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {
+                    "used_percent": 0,
+                    "limit_window_seconds": 18000,
+                    "reset_after_seconds": 1800,
+                    "reset_at": 1744200000
+                },
+                "secondary_window": {
+                    "used_percent": 36,
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 86400,
+                    "reset_at": 1744700000
+                }
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/codex/usage"))
+        .and(header(
+            "authorization",
+            format!("Bearer {connor_access_token}"),
+        ))
+        .and(header("chatgpt-account-id", "org-connor"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "plan_type": "plus",
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {
+                    "used_percent": 0,
+                    "limit_window_seconds": 18000,
+                    "reset_after_seconds": 18000,
+                    "reset_at": 1744260000
+                },
+                "secondary_window": {
+                    "used_percent": 29,
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 86400,
+                    "reset_at": 1744800000
+                }
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_raw_request("accountPool/switchNext", Some(json!({})))
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let received: AccountPoolSwitchNextResponse = to_response(response)?;
+    let requests = mock_server
+        .received_requests()
+        .await
+        .expect("wiremock should expose received requests");
+    let usage_request_count = requests
+        .iter()
+        .filter(|request| request.url.path() == "/api/codex/usage")
+        .count();
+    assert_eq!(usage_request_count, 3);
+    let pool = manager.load()?;
+    let zhang = pool
+        .accounts
+        .iter()
+        .find(|account| account.alias == "zhangyukun")
+        .expect("zhangyukun account should exist");
+    assert_eq!(zhang.usage_health.five_hour_remaining_percent, Some(100));
+    assert_eq!(zhang.usage_health.weekly_remaining_percent, Some(64));
+    assert!(!zhang.usage_health.quota_exhausted);
+
+    assert_eq!(
+        received,
+        AccountPoolSwitchNextResponse {
+            current_alias: Some("zhangyukun".to_string()),
+            switched: true,
+        }
+    );
+    assert_eq!(pool.current_alias, Some("zhangyukun".to_string()));
+
     Ok(())
 }
