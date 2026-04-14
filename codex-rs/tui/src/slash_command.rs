@@ -138,6 +138,7 @@ impl SlashCommand {
                 | SlashCommand::Rename
                 | SlashCommand::Plan
                 | SlashCommand::Fast
+                | SlashCommand::Resume
                 | SlashCommand::Reload
                 | SlashCommand::Import
                 | SlashCommand::Switch

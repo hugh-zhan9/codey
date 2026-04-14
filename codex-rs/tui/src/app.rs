@@ -4,6 +4,7 @@ use crate::app_command::AppCommandView;
 use crate::app_event::AppEvent;
 use crate::app_event::ExitMode;
 use crate::app_event::FeedbackCategory;
+use crate::app_event::RateLimitRefreshOrigin;
 use crate::app_event::RealtimeAudioDeviceKind;
 use crate::app_event::ReloadedAccountState;
 #[cfg(target_os = "windows")]
@@ -35,6 +36,7 @@ use crate::history_cell;
 use crate::history_cell::HistoryCell;
 #[cfg(not(debug_assertions))]
 use crate::history_cell::UpdateAvailableHistoryCell;
+use crate::legacy_core;
 use crate::model_catalog::ModelCatalog;
 use crate::model_migration::ModelMigrationOutcome;
 use crate::model_migration::migration_copy_for_models;
@@ -107,9 +109,9 @@ use codex_core::config::ConfigOverrides;
 use codex_core::config::edit::ConfigEdit;
 use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::config_loader::ConfigLayerStackOrdering;
-use codex_core::message_history;
 #[cfg(target_os = "windows")]
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
+use codex_exec_server::EnvironmentManager;
 use codex_features::Feature;
 use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_models_manager::model_presets::HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG;
@@ -1038,7 +1040,7 @@ fn normalize_harness_overrides_for_cwd(
 
     let mut normalized = Vec::with_capacity(overrides.additional_writable_roots.len());
     for root in overrides.additional_writable_roots.drain(..) {
-        let absolute = AbsolutePathBuf::resolve_path_against_base(root, base_cwd)?;
+        let absolute = AbsolutePathBuf::resolve_path_against_base(root, base_cwd);
         normalized.push(absolute.into_path_buf());
     }
     overrides.additional_writable_roots = normalized;
@@ -1121,7 +1123,7 @@ impl App {
         overrides.cwd = Some(cwd.clone());
         let cwd_display = cwd.display().to_string();
         ConfigBuilder::default()
-            .codex_home(self.config.codex_home.clone())
+            .codex_home(self.config.codex_home.clone().to_path_buf())
             .cli_overrides(self.cli_kv_overrides.clone())
             .harness_overrides(overrides)
             .build()
@@ -1909,14 +1911,18 @@ impl App {
         });
     }
 
-    fn refresh_rate_limits(&mut self, app_server: &AppServerSession, request_id: u64) {
+    fn refresh_rate_limits(
+        &mut self,
+        app_server: &AppServerSession,
+        origin: RateLimitRefreshOrigin,
+    ) {
         let request_handle = app_server.request_handle();
         let app_event_tx = self.app_event_tx.clone();
         tokio::spawn(async move {
             let result = fetch_account_rate_limits(request_handle)
                 .await
                 .map_err(|err| err.to_string());
-            app_event_tx.send(AppEvent::RateLimitsLoaded { request_id, result });
+            app_event_tx.send(AppEvent::RateLimitsLoaded { origin, result });
         });
     }
 
@@ -2278,7 +2284,7 @@ impl App {
                 let config = self.chat_widget.config_ref().clone();
                 tokio::spawn(async move {
                     if let Err(err) =
-                        message_history::append_entry(&text, &thread_id, &config).await
+                        legacy_core::append_message_history_entry(&text, &thread_id, &config).await
                     {
                         tracing::warn!(
                             thread_id = %thread_id,
@@ -2296,7 +2302,7 @@ impl App {
                 let app_event_tx = self.app_event_tx.clone();
                 tokio::spawn(async move {
                     let entry_opt = tokio::task::spawn_blocking(move || {
-                        message_history::lookup(log_id, offset, &config)
+                        legacy_core::lookup_message_history_entry(log_id, offset, &config)
                     })
                     .await
                     .unwrap_or_else(|err| {
@@ -3688,7 +3694,10 @@ impl App {
         let app_event_tx = AppEventSender::new(app_event_tx);
         emit_project_config_warnings(&app_event_tx, &config);
         emit_system_bwrap_warning(&app_event_tx, &config);
-        tui.set_notification_method(config.tui_notification_method);
+        tui.set_notification_settings(
+            config.tui_notifications.method,
+            config.tui_notifications.condition,
+        );
 
         let harness_overrides =
             normalize_harness_overrides_for_cwd(harness_overrides, &config.cwd)?;
@@ -4156,6 +4165,7 @@ impl App {
                         },
                         None => crate::AppServerTarget::Embedded,
                     },
+                    Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
                 )
                 .await
                 {
@@ -4224,7 +4234,10 @@ impl App {
                             Ok(resumed) => {
                                 self.shutdown_current_thread(app_server).await;
                                 self.config = resume_config;
-                                tui.set_notification_method(self.config.tui_notification_method);
+                                tui.set_notification_settings(
+                                    self.config.tui_notifications.method,
+                                    self.config.tui_notifications.condition,
+                                );
                                 self.file_search
                                     .update_search_dir(self.config.cwd.to_path_buf());
                                 match self
@@ -4628,21 +4641,30 @@ impl App {
                     .chat_widget
                     .add_error_message(format!("Failed to switch account: {err}")),
             },
-            AppEvent::RefreshRateLimits { request_id } => {
-                self.refresh_rate_limits(app_server, request_id);
+            AppEvent::RefreshRateLimits { origin } => {
+                self.refresh_rate_limits(app_server, origin);
             }
-            AppEvent::RateLimitsLoaded { request_id, result } => match result {
+            AppEvent::RateLimitsLoaded { origin, result } => match result {
                 Ok(snapshots) => {
                     for snapshot in snapshots {
                         self.chat_widget.on_rate_limit_snapshot(Some(snapshot));
                     }
-                    self.chat_widget
-                        .finish_status_rate_limit_refresh(request_id);
+                    match origin {
+                        RateLimitRefreshOrigin::StartupPrefetch => {
+                            tui.frame_requester().schedule_frame();
+                        }
+                        RateLimitRefreshOrigin::StatusCommand { request_id } => {
+                            self.chat_widget
+                                .finish_status_rate_limit_refresh(request_id);
+                        }
+                    }
                 }
                 Err(err) => {
                     tracing::warn!("account/rateLimits/read failed during TUI refresh: {err}");
-                    self.chat_widget
-                        .finish_status_rate_limit_refresh(request_id);
+                    if let RateLimitRefreshOrigin::StatusCommand { request_id } = origin {
+                        self.chat_widget
+                            .finish_status_rate_limit_refresh(request_id);
+                    }
                 }
             },
             AppEvent::ConnectorsLoaded { result, is_final } => {
@@ -4659,6 +4681,15 @@ impl App {
             }
             AppEvent::UpdatePersonality(personality) => {
                 self.on_update_personality(personality);
+            }
+            AppEvent::RealtimeWebrtcOfferCreated { result } => {
+                self.chat_widget.on_realtime_webrtc_offer_created(result);
+            }
+            AppEvent::RealtimeWebrtcEvent(event) => {
+                self.chat_widget.on_realtime_webrtc_event(event);
+            }
+            AppEvent::RealtimeWebrtcLocalAudioLevel(peak) => {
+                self.chat_widget.on_realtime_webrtc_local_audio_level(peak);
             }
             AppEvent::OpenRealtimeAudioDeviceSelection { kind } => {
                 self.chat_widget.open_realtime_audio_device_selection(kind);
@@ -4705,6 +4736,7 @@ impl App {
             AppEvent::SubmitFeedback {
                 category,
                 reason,
+                turn_id: _,
                 include_logs,
             } => {
                 self.submit_feedback(app_server, category, reason, include_logs);
@@ -5480,7 +5512,18 @@ impl App {
                     .await
                 {
                     Ok(()) => {
-                        self.chat_widget.update_skill_enabled(path.clone(), enabled);
+                        match AbsolutePathBuf::try_from(path.clone()) {
+                            Ok(skill_path) => {
+                                self.chat_widget.update_skill_enabled(skill_path, enabled);
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    path = %path.display(),
+                                    "skipping in-memory skill state refresh for non-absolute path"
+                                );
+                            }
+                        }
                         if let Err(err) = self.refresh_in_memory_config_from_disk().await {
                             tracing::warn!(
                                 error = %err,
@@ -6499,6 +6542,7 @@ fn build_feedback_upload_params(
         thread_id: origin_thread_id.map(|thread_id| thread_id.to_string()),
         include_logs,
         extra_log_files,
+        tags: None,
     }
 }
 

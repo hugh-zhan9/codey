@@ -26,6 +26,8 @@ use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::GetHistoryEntryResponseEvent;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RateLimitSnapshot;
+use codex_realtime_webrtc::RealtimeWebrtcEvent;
+use codex_realtime_webrtc::RealtimeWebrtcSessionHandle;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_approval_presets::ApprovalPreset;
 
@@ -88,6 +90,12 @@ pub(crate) struct ReloadedAccountState {
     pub(crate) rate_limit_snapshots: Vec<RateLimitSnapshot>,
     pub(crate) message: String,
     pub(crate) hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RateLimitRefreshOrigin {
+    StartupPrefetch,
+    StatusCommand { request_id: u64 },
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -207,12 +215,12 @@ pub(crate) enum AppEvent {
 
     /// Refresh account rate limits in the background.
     RefreshRateLimits {
-        request_id: u64,
+        origin: RateLimitRefreshOrigin,
     },
 
     /// Result of refreshing rate limits.
     RateLimitsLoaded {
-        request_id: u64,
+        origin: RateLimitRefreshOrigin,
         result: Result<Vec<RateLimitSnapshot>, String>,
     },
 
@@ -391,6 +399,17 @@ pub(crate) enum AppEvent {
     RestartRealtimeAudioDevice {
         kind: RealtimeAudioDeviceKind,
     },
+
+    /// Result of creating a TUI-owned realtime WebRTC offer.
+    RealtimeWebrtcOfferCreated {
+        result: Result<RealtimeWebrtcOffer, String>,
+    },
+
+    /// Peer-connection lifecycle event from a TUI-owned realtime WebRTC session.
+    RealtimeWebrtcEvent(RealtimeWebrtcEvent),
+
+    /// Local microphone level from a TUI-owned realtime WebRTC session.
+    RealtimeWebrtcLocalAudioLevel(u16),
 
     /// Open the reasoning selection popup after picking a model.
     OpenReasoningPopup {
@@ -594,6 +613,7 @@ pub(crate) enum AppEvent {
     SubmitFeedback {
         category: FeedbackCategory,
         reason: Option<String>,
+        turn_id: Option<String>,
         include_logs: bool,
     },
 
@@ -635,6 +655,12 @@ pub(crate) enum AppEvent {
     SyntaxThemeSelected {
         name: String,
     },
+}
+
+#[derive(Debug)]
+pub(crate) struct RealtimeWebrtcOffer {
+    pub(crate) offer_sdp: String,
+    pub(crate) handle: RealtimeWebrtcSessionHandle,
 }
 
 /// The exit strategy requested by the UI layer.

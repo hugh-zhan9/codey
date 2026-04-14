@@ -100,6 +100,7 @@ use crate::bottom_pane::StatusLinePreviewData;
 use crate::bottom_pane::StatusLineSetupView;
 use crate::bottom_pane::TerminalTitleItem;
 use crate::bottom_pane::TerminalTitleSetupView;
+use crate::legacy_core::DEFAULT_PROJECT_DOC_FILENAME;
 use crate::mention_codec::LinkedMention;
 use crate::mention_codec::encode_history_mentions;
 use crate::model_catalog::ModelCatalog;
@@ -152,7 +153,6 @@ use codex_core::config::ConstraintResult;
 use codex_core::config_loader::ConfigLayerStackOrdering;
 use codex_core::find_thread_name_by_id;
 use codex_core::plugins::PluginsManager;
-use codex_core::project_doc::DEFAULT_PROJECT_DOC_FILENAME;
 use codex_core::skills::model::SkillMetadata;
 #[cfg(target_os = "windows")]
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
@@ -839,7 +839,7 @@ pub(crate) struct ChatWidget {
     pending_collab_spawn_requests: HashMap<String, multi_agents::SpawnRequestSummary>,
     suppressed_exec_calls: HashSet<String>,
     skills_all: Vec<ProtocolSkillMetadata>,
-    skills_initial_state: Option<HashMap<PathBuf, bool>>,
+    skills_initial_state: Option<HashMap<AbsolutePathBuf, bool>>,
     last_unified_wait: Option<UnifiedExecWaitState>,
     unified_exec_wait_streak: Option<UnifiedExecWaitStreak>,
     turn_sleep_inhibitor: SleepInhibitor,
@@ -2172,6 +2172,7 @@ impl ChatWidget {
     ) {
         let view = crate::bottom_pane::FeedbackNoteView::new(
             category,
+            None,
             self.app_event_tx.clone(),
             include_logs,
         );
@@ -5104,15 +5105,7 @@ impl ChatWidget {
                 self.app_event_tx.send(AppEvent::ForkCurrentSession);
             }
             SlashCommand::Init => {
-                let init_target = match self.config.cwd.join(DEFAULT_PROJECT_DOC_FILENAME) {
-                    Ok(path) => path,
-                    Err(err) => {
-                        self.add_error_message(format!(
-                            "Failed to prepare {DEFAULT_PROJECT_DOC_FILENAME}: {err}",
-                        ));
-                        return;
-                    }
-                };
+                let init_target = self.config.cwd.join(DEFAULT_PROJECT_DOC_FILENAME);
                 if init_target.exists() {
                     let message = format!(
                         "{DEFAULT_PROJECT_DOC_FILENAME} already exists here. Skipping /init to avoid overwriting it."
@@ -5348,8 +5341,11 @@ impl ChatWidget {
                     self.next_status_refresh_request_id =
                         self.next_status_refresh_request_id.wrapping_add(1);
                     self.add_status_output(/*refreshing_rate_limits*/ true, Some(request_id));
-                    self.app_event_tx
-                        .send(AppEvent::RefreshRateLimits { request_id });
+                    self.app_event_tx.send(AppEvent::RefreshRateLimits {
+                        origin: crate::app_event::RateLimitRefreshOrigin::StatusCommand {
+                            request_id,
+                        },
+                    });
                 } else {
                     self.add_status_output(
                         /*refreshing_rate_limits*/ false, /*request_id*/ None,
@@ -5757,7 +5753,7 @@ impl ChatWidget {
             .map(|binding| binding.mention.clone())
             .collect();
         let mut skill_names_lower: HashSet<String> = HashSet::new();
-        let mut selected_skill_paths: HashSet<PathBuf> = HashSet::new();
+        let mut selected_skill_paths: HashSet<AbsolutePathBuf> = HashSet::new();
         let mut selected_plugin_ids: HashSet<String> = HashSet::new();
 
         if let Some(skills) = self.bottom_pane.skills() {
@@ -5779,7 +5775,7 @@ impl ChatWidget {
                 {
                     items.push(UserInput::Skill {
                         name: skill.name.clone(),
-                        path: skill.path_to_skills_md.clone(),
+                        path: skill.path_to_skills_md.to_path_buf(),
                     });
                 }
             }
@@ -5793,7 +5789,7 @@ impl ChatWidget {
                 }
                 items.push(UserInput::Skill {
                     name: skill.name.clone(),
-                    path: skill.path_to_skills_md.clone(),
+                    path: skill.path_to_skills_md.to_path_buf(),
                 });
             }
         }
@@ -6644,7 +6640,9 @@ impl ChatWidget {
             | ServerNotification::ContextCompacted(_)
             | ServerNotification::FuzzyFileSearchSessionUpdated(_)
             | ServerNotification::FuzzyFileSearchSessionCompleted(_)
-            | ServerNotification::ThreadRealtimeTranscriptUpdated(_)
+            | ServerNotification::ThreadRealtimeTranscriptDelta(_)
+            | ServerNotification::ThreadRealtimeTranscriptDone(_)
+            | ServerNotification::ThreadRealtimeSdp(_)
             | ServerNotification::WindowsWorldWritableWarning(_)
             | ServerNotification::WindowsSandboxSetupCompleted(_)
             | ServerNotification::AccountLoginCompleted(_) => {}
@@ -6837,13 +6835,17 @@ impl ChatWidget {
 
     fn on_guardian_review_notification(
         &mut self,
-        id: String,
+        id: Option<String>,
         turn_id: String,
         review: codex_app_server_protocol::GuardianApprovalReview,
         action: GuardianApprovalReviewAction,
     ) {
         self.on_guardian_assessment(GuardianAssessmentEvent {
-            id,
+            id: format!(
+                "guardian-review:{turn_id}:{}",
+                id.as_deref().unwrap_or("unknown")
+            ),
+            target_item_id: id,
             turn_id,
             status: match review.status {
                 codex_app_server_protocol::GuardianApprovalReviewStatus::InProgress => {
@@ -6855,11 +6857,13 @@ impl ChatWidget {
                 codex_app_server_protocol::GuardianApprovalReviewStatus::Denied => {
                     GuardianAssessmentStatus::Denied
                 }
+                codex_app_server_protocol::GuardianApprovalReviewStatus::TimedOut => {
+                    GuardianAssessmentStatus::TimedOut
+                }
                 codex_app_server_protocol::GuardianApprovalReviewStatus::Aborted => {
                     GuardianAssessmentStatus::Aborted
                 }
             },
-            risk_score: review.risk_score,
             risk_level: review.risk_level.map(|risk_level| match risk_level {
                 codex_app_server_protocol::GuardianRiskLevel::Low => {
                     codex_protocol::protocol::GuardianRiskLevel::Low
@@ -6870,8 +6874,28 @@ impl ChatWidget {
                 codex_app_server_protocol::GuardianRiskLevel::High => {
                     codex_protocol::protocol::GuardianRiskLevel::High
                 }
+                codex_app_server_protocol::GuardianRiskLevel::Critical => {
+                    codex_protocol::protocol::GuardianRiskLevel::Critical
+                }
+            }),
+            user_authorization: review.user_authorization.map(|user_authorization| {
+                match user_authorization {
+                    codex_app_server_protocol::GuardianUserAuthorization::Unknown => {
+                        codex_protocol::protocol::GuardianUserAuthorization::Unknown
+                    }
+                    codex_app_server_protocol::GuardianUserAuthorization::Low => {
+                        codex_protocol::protocol::GuardianUserAuthorization::Low
+                    }
+                    codex_app_server_protocol::GuardianUserAuthorization::Medium => {
+                        codex_protocol::protocol::GuardianUserAuthorization::Medium
+                    }
+                    codex_app_server_protocol::GuardianUserAuthorization::High => {
+                        codex_protocol::protocol::GuardianUserAuthorization::High
+                    }
+                }
             }),
             rationale: review.rationale,
+            decision_source: None,
             action: action.into(),
         });
     }
@@ -7326,7 +7350,7 @@ impl ChatWidget {
     }
 
     fn notify(&mut self, notification: Notification) {
-        if !notification.allowed_for(&self.config.tui_notifications) {
+        if !notification.allowed_for(&self.config.tui_notifications.notifications) {
             return;
         }
         if let Some(existing) = self.pending_notification.as_ref()
@@ -10948,10 +10972,15 @@ impl ChatWidget {
             return;
         }
 
-        let plugins = PluginsManager::new(self.config.codex_home.clone())
-            .plugins_for_config(&self.config)
-            .capability_summaries()
-            .to_vec();
+        let plugins = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                PluginsManager::new(self.config.codex_home.clone().to_path_buf())
+                    .plugins_for_config(&self.config)
+                    .await
+            })
+        })
+        .capability_summaries()
+        .to_vec();
         self.bottom_pane.set_plugin_mentions(Some(plugins));
     }
 

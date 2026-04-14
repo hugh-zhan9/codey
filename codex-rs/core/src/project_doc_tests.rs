@@ -334,8 +334,7 @@ async fn project_root_markers_are_honored_for_agents_discovery() {
     )
     .expect("absolute parent doc path");
     let expected_child = AbsolutePathBuf::try_from(
-        dunce::canonicalize(cfg.cwd.join("AGENTS.md").expect("absolute child doc path"))
-            .expect("canonical child doc path"),
+        dunce::canonicalize(cfg.cwd.join("AGENTS.md")).expect("canonical child doc path"),
     )
     .expect("absolute child doc path");
     assert_eq!(discovery.len(), 2);
@@ -500,7 +499,7 @@ async fn skills_are_not_appended_to_project_doc() {
 
     let cfg = make_config(&tmp, /*limit*/ 4096, /*instructions*/ None).await;
     create_skill(
-        cfg.codex_home.clone(),
+        cfg.codex_home.to_path_buf(),
         "pdf-processing",
         "extract from pdfs",
     );

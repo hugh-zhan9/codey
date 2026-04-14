@@ -408,7 +408,7 @@ impl RolloutRecorder {
                         agent_path: source.get_agent_path().map(Into::into),
                         source,
                         model_provider: Some(config.model_provider_id().to_string()),
-                        base_instructions: Some(base_instructions),
+                        base_instructions,
                         dynamic_tools: if dynamic_tools.is_empty() {
                             None
                         } else {
@@ -958,6 +958,18 @@ struct RolloutLineRef<'a> {
     timestamp: String,
     #[serde(flatten)]
     item: &'a RolloutItem,
+}
+
+pub async fn append_rollout_item_to_path(
+    rollout_path: &Path,
+    item: &RolloutItem,
+) -> std::io::Result<()> {
+    let file = tokio::fs::OpenOptions::new()
+        .append(true)
+        .open(rollout_path)
+        .await?;
+    let mut writer = JsonlWriter { file };
+    writer.write_rollout_item(item).await
 }
 
 impl JsonlWriter {

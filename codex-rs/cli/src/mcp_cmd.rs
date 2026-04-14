@@ -8,24 +8,24 @@ use anyhow::bail;
 use clap::ArgGroup;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
+use codex_core::McpManager;
 use codex_core::config::Config;
 use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::config::find_codex_home;
 use codex_core::config::load_global_mcp_servers;
-use codex_core::mcp::McpManager;
 use codex_core::plugins::PluginsManager;
-use codex_mcp::mcp::auth::McpOAuthLoginSupport;
-use codex_mcp::mcp::auth::ResolvedMcpOAuthScopes;
-use codex_mcp::mcp::auth::compute_auth_statuses;
-use codex_mcp::mcp::auth::discover_supported_scopes;
-use codex_mcp::mcp::auth::oauth_login_support;
-use codex_mcp::mcp::auth::resolve_oauth_scopes;
-use codex_mcp::mcp::auth::should_retry_without_scopes;
+use codex_mcp::McpOAuthLoginSupport;
+use codex_mcp::ResolvedMcpOAuthScopes;
+use codex_mcp::compute_auth_statuses;
+use codex_mcp::discover_supported_scopes;
+use codex_mcp::oauth_login_support;
+use codex_mcp::resolve_oauth_scopes;
+use codex_mcp::should_retry_without_scopes;
 use codex_protocol::protocol::McpAuthStatus;
 use codex_rmcp_client::delete_oauth_tokens;
 use codex_rmcp_client::perform_oauth_login;
 use codex_utils_cli::CliConfigOverrides;
-use codex_utils_cli::format_env_display::format_env_display;
+use codex_utils_cli::format_env_display;
 
 /// Subcommands:
 /// - `list`   — list configured servers (with `--json`)
@@ -299,6 +299,7 @@ async fn run_add(config_overrides: &CliConfigOverrides, add_args: AddArgs) -> Re
         transport: transport.clone(),
         enabled: true,
         required: false,
+        supports_parallel_tool_calls: false,
         disabled_reason: None,
         startup_timeout_sec: None,
         tool_timeout_sec: None,
@@ -390,8 +391,10 @@ async fn run_login(config_overrides: &CliConfigOverrides, login_args: LoginArgs)
     let config = Config::load_with_cli_overrides(overrides)
         .await
         .context("failed to load configuration")?;
-    let mcp_manager = McpManager::new(Arc::new(PluginsManager::new(config.codex_home.clone())));
-    let mcp_servers = mcp_manager.effective_servers(&config, /*auth*/ None);
+    let mcp_manager = McpManager::new(Arc::new(PluginsManager::new(
+        config.codex_home.to_path_buf(),
+    )));
+    let mcp_servers = mcp_manager.effective_servers(&config, /*auth*/ None).await;
 
     let LoginArgs { name, scopes } = login_args;
 
@@ -441,8 +444,10 @@ async fn run_logout(config_overrides: &CliConfigOverrides, logout_args: LogoutAr
     let config = Config::load_with_cli_overrides(overrides)
         .await
         .context("failed to load configuration")?;
-    let mcp_manager = McpManager::new(Arc::new(PluginsManager::new(config.codex_home.clone())));
-    let mcp_servers = mcp_manager.effective_servers(&config, /*auth*/ None);
+    let mcp_manager = McpManager::new(Arc::new(PluginsManager::new(
+        config.codex_home.to_path_buf(),
+    )));
+    let mcp_servers = mcp_manager.effective_servers(&config, /*auth*/ None).await;
 
     let LogoutArgs { name } = logout_args;
 
@@ -471,8 +476,10 @@ async fn run_list(config_overrides: &CliConfigOverrides, list_args: ListArgs) ->
     let config = Config::load_with_cli_overrides(overrides)
         .await
         .context("failed to load configuration")?;
-    let mcp_manager = McpManager::new(Arc::new(PluginsManager::new(config.codex_home.clone())));
-    let mcp_servers = mcp_manager.effective_servers(&config, /*auth*/ None);
+    let mcp_manager = McpManager::new(Arc::new(PluginsManager::new(
+        config.codex_home.to_path_buf(),
+    )));
+    let mcp_servers = mcp_manager.effective_servers(&config, /*auth*/ None).await;
 
     let mut entries: Vec<_> = mcp_servers.iter().collect();
     entries.sort_by(|(a, _), (b, _)| a.cmp(b));
@@ -720,8 +727,10 @@ async fn run_get(config_overrides: &CliConfigOverrides, get_args: GetArgs) -> Re
     let config = Config::load_with_cli_overrides(overrides)
         .await
         .context("failed to load configuration")?;
-    let mcp_manager = McpManager::new(Arc::new(PluginsManager::new(config.codex_home.clone())));
-    let mcp_servers = mcp_manager.effective_servers(&config, /*auth*/ None);
+    let mcp_manager = McpManager::new(Arc::new(PluginsManager::new(
+        config.codex_home.to_path_buf(),
+    )));
+    let mcp_servers = mcp_manager.effective_servers(&config, /*auth*/ None).await;
 
     let Some(server) = mcp_servers.get(&get_args.name) else {
         bail!("No MCP server named '{name}' found.", name = get_args.name);

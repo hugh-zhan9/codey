@@ -9,7 +9,6 @@ use std::sync::atomic::Ordering;
 use crate::codex_message_processor::CodexMessageProcessor;
 use crate::codex_message_processor::CodexMessageProcessorArgs;
 use crate::config_api::ConfigApi;
-use crate::error_code::INTERNAL_ERROR_CODE;
 use crate::error_code::INVALID_REQUEST_ERROR_CODE;
 use crate::external_agent_config_api::ExternalAgentConfigApi;
 use crate::fs_api::FsApi;
@@ -19,6 +18,7 @@ use crate::outgoing_message::ConnectionRequestId;
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::RequestContext;
 use crate::transport::AppServerTransport;
+use crate::transport::RemoteControlHandle;
 use async_trait::async_trait;
 use codex_analytics::AnalyticsEventsClient;
 use codex_analytics::AppServerRpcTransport;
@@ -170,6 +170,7 @@ pub(crate) struct MessageProcessor {
     config: Arc<Config>,
     config_warnings: Arc<Vec<ConfigWarningNotification>>,
     rpc_transport: AppServerRpcTransport,
+    remote_control_handle: Option<RemoteControlHandle>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -195,6 +196,7 @@ pub(crate) struct MessageProcessorArgs {
     pub(crate) session_source: SessionSource,
     pub(crate) auth_manager: Arc<AuthManager>,
     pub(crate) rpc_transport: AppServerRpcTransport,
+    pub(crate) remote_control_handle: Option<RemoteControlHandle>,
 }
 
 impl MessageProcessor {
@@ -215,10 +217,16 @@ impl MessageProcessor {
             session_source,
             auth_manager,
             rpc_transport,
+            remote_control_handle,
         } = args;
         auth_manager.set_external_auth(Arc::new(ExternalAuthRefreshBridge {
             outgoing: outgoing.clone(),
         }));
+        let analytics_events_client = AnalyticsEventsClient::new(
+            Arc::clone(&auth_manager),
+            config.chatgpt_base_url.trim_end_matches('/').to_string(),
+            config.analytics_enabled,
+        );
         let thread_manager = Arc::new(ThreadManager::new(
             config.as_ref(),
             auth_manager.clone(),
@@ -229,12 +237,8 @@ impl MessageProcessor {
                     .enabled(Feature::DefaultModeRequestUserInput),
             },
             environment_manager,
+            Some(analytics_events_client.clone()),
         ));
-        let analytics_events_client = AnalyticsEventsClient::new(
-            Arc::clone(&auth_manager),
-            config.chatgpt_base_url.trim_end_matches('/').to_string(),
-            config.analytics_enabled,
-        );
         thread_manager
             .plugins_manager()
             .set_analytics_events_client(analytics_events_client.clone());
@@ -261,7 +265,7 @@ impl MessageProcessor {
             .plugins_manager()
             .maybe_start_plugin_startup_tasks_for_config(&config, auth_manager.clone());
         let config_api = ConfigApi::new(
-            config.codex_home.clone(),
+            config.codex_home.to_path_buf(),
             cli_overrides,
             runtime_feature_enablement,
             loader_overrides,
@@ -269,7 +273,8 @@ impl MessageProcessor {
             thread_manager,
             analytics_events_client.clone(),
         );
-        let external_agent_config_api = ExternalAgentConfigApi::new(config.codex_home.clone());
+        let external_agent_config_api =
+            ExternalAgentConfigApi::new(config.codex_home.to_path_buf());
         let fs_api = FsApi::default();
         let fs_watch_manager = FsWatchManager::new(outgoing.clone());
 
@@ -285,6 +290,7 @@ impl MessageProcessor {
             config,
             config_warnings: Arc::new(config_warnings),
             rpc_transport,
+            remote_control_handle,
         }
     }
 
@@ -506,14 +512,14 @@ impl MessageProcessor {
     }
 
     /// Handle a standalone JSON-RPC response originating from the peer.
-    pub(crate) async fn process_response(&mut self, response: JSONRPCResponse) {
+    pub(crate) async fn process_response(&self, response: JSONRPCResponse) {
         tracing::info!("<- response: {:?}", response);
         let JSONRPCResponse { id, result, .. } = response;
         self.outgoing.notify_client_response(id, result).await
     }
 
     /// Handle an error object received from the peer.
-    pub(crate) async fn process_error(&mut self, err: JSONRPCError) {
+    pub(crate) async fn process_error(&self, err: JSONRPCError) {
         tracing::error!("<- error: {:?}", err);
         self.outgoing.notify_client_error(err.id, err.error).await;
     }
@@ -614,21 +620,9 @@ impl MessageProcessor {
                 }
 
                 let user_agent = get_codex_user_agent();
-                let codex_home = match self.config.codex_home.clone().try_into() {
-                    Ok(codex_home) => codex_home,
-                    Err(err) => {
-                        let error = JSONRPCErrorError {
-                            code: INTERNAL_ERROR_CODE,
-                            message: format!("Invalid CODEX_HOME: {err}"),
-                            data: None,
-                        };
-                        self.outgoing.send_error(connection_request_id, error).await;
-                        return;
-                    }
-                };
                 let response = InitializeResponse {
                     user_agent,
-                    codex_home,
+                    codex_home: self.config.codex_home.clone(),
                     platform_family: std::env::consts::FAMILY.to_string(),
                     platform_os: std::env::consts::OS.to_string(),
                 };
@@ -670,6 +664,16 @@ impl MessageProcessor {
             };
             self.outgoing.send_error(connection_request_id, error).await;
             return;
+        }
+        if self.config.features.enabled(Feature::GeneralAnalytics)
+            && let ClientRequest::TurnStart { request_id, .. }
+            | ClientRequest::TurnSteer { request_id, .. } = &codex_request
+        {
+            self.analytics_events_client.track_request(
+                connection_id.0,
+                request_id.clone(),
+                codex_request.clone(),
+            );
         }
 
         match codex_request {
@@ -969,10 +973,33 @@ impl MessageProcessor {
     ) {
         match result {
             Ok(response) => {
-                self.codex_message_processor.handle_config_mutation();
+                self.handle_config_mutation().await;
                 self.outgoing.send_response(request_id, response).await;
             }
             Err(error) => self.outgoing.send_error(request_id, error).await,
+        }
+    }
+
+    async fn handle_config_mutation(&self) {
+        self.codex_message_processor.handle_config_mutation();
+        let Some(remote_control_handle) = &self.remote_control_handle else {
+            return;
+        };
+
+        match self
+            .config_api
+            .load_latest_config(/*fallback_cwd*/ None)
+            .await
+        {
+            Ok(config) => {
+                remote_control_handle.set_enabled(config.features.enabled(Feature::RemoteControl));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "failed to load config for remote control enablement refresh after config mutation: {}",
+                    error.message
+                );
+            }
         }
     }
 

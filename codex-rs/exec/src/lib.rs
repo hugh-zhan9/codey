@@ -14,6 +14,7 @@ pub use cli::Cli;
 pub use cli::Command;
 pub use cli::ReviewArgs;
 use codex_app_server_client::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
+use codex_app_server_client::EnvironmentManager;
 use codex_app_server_client::InProcessAppServerClient;
 use codex_app_server_client::InProcessClientStartArgs;
 use codex_app_server_client::InProcessServerEvent;
@@ -95,6 +96,7 @@ use std::io::IsTerminal;
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use supports_color::Stream;
 use tokio::sync::mpsc;
 use tracing::Instrument;
@@ -262,7 +264,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     #[allow(clippy::print_stderr)]
     let config_toml = match load_config_as_toml_with_cli_overrides(
         &codex_home,
-        &config_cwd,
+        Some(&config_cwd),
         cli_kv_overrides.clone(),
     )
     .await
@@ -291,7 +293,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string());
     // TODO(gt): Make cloud requirements failures blocking once we can fail-closed.
     let cloud_requirements = cloud_requirements_loader_for_storage(
-        codex_home.clone(),
+        codex_home.clone().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         config_toml.cli_auth_credentials_store.unwrap_or_default(),
         chatgpt_base_url,
@@ -381,7 +383,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     set_default_client_residency_requirement(config.enforce_residency.value());
 
     if let Err(err) = enforce_login_restrictions(&AuthConfig {
-        codex_home: config.codex_home.clone(),
+        codex_home: config.codex_home.clone().to_path_buf(),
         auth_credentials_store_mode: config.cli_auth_credentials_store_mode,
         forced_login_method: config.forced_login_method,
         forced_chatgpt_workspace_id: config.forced_chatgpt_workspace_id.clone(),
@@ -440,6 +442,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         loader_overrides: run_loader_overrides,
         cloud_requirements: run_cloud_requirements,
         feedback: CodexFeedback::new(),
+        environment_manager: Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
         config_warnings,
         session_source: SessionSource::Exec,
         enable_codex_api_key_env: true,
@@ -683,6 +686,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     params: TurnStartParams {
                         thread_id: primary_thread_id_for_span.clone(),
                         input: items.into_iter().map(Into::into).collect(),
+                        responsesapi_client_metadata: None,
                         cwd: Some(default_cwd),
                         approval_policy: Some(default_approval_policy.into()),
                         approvals_reviewer: None,
@@ -1497,7 +1501,7 @@ fn local_external_chatgpt_tokens(
     config: &Config,
 ) -> Result<ChatgptAuthTokensRefreshResponse, String> {
     let auth_manager = AuthManager::shared(
-        config.codex_home.clone(),
+        config.codex_home.clone().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         config.cli_auth_credentials_store_mode,
     );
@@ -1522,6 +1526,7 @@ fn local_external_chatgpt_tokens(
         AccountPlanType::Go => "go".to_string(),
         AccountPlanType::Plus => "plus".to_string(),
         AccountPlanType::Pro => "pro".to_string(),
+        AccountPlanType::ProLite => "pro_lite".to_string(),
         AccountPlanType::Team => "team".to_string(),
         AccountPlanType::Business => "business".to_string(),
         AccountPlanType::SelfServeBusinessUsageBased => {

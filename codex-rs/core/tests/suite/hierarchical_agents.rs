@@ -26,8 +26,9 @@ async fn hierarchical_agents_appends_to_project_doc_in_user_instructions() {
                 .expect("test config should allow feature update");
         })
         .with_workspace_setup(|cwd, fs| async move {
-            let agents_md = cwd.join("AGENTS.md").expect("absolute AGENTS.md path");
-            fs.write_file(&agents_md, b"be nice".to_vec()).await?;
+            let agents_md = cwd.join("AGENTS.md");
+            fs.write_file(&agents_md, b"be nice".to_vec(), /*sandbox*/ None)
+                .await?;
             Ok::<(), anyhow::Error>(())
         });
     let test = builder

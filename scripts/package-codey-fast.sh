@@ -5,10 +5,11 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKSPACE_CARGO_TOML="$REPO_ROOT/codex-rs/Cargo.toml"
 OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/dist}"
-TARGET_DIR="${CARGO_TARGET_DIR:-${TMPDIR:-/tmp}/codey-pack-target}"
+TARGET_DIR="${CARGO_TARGET_DIR:-}"
 INSTALL_AFTER_PACK=0
 USE_RELEASE=0
 VERSION=""
+TARGET_DIR_WAS_DEFAULT=0
 
 usage() {
   cat <<'EOF'
@@ -23,7 +24,7 @@ Options:
 
 Environment:
   OUTPUT_DIR           Directory for the generated tarball. Default: <repo>/dist
-  CARGO_TARGET_DIR     Cargo target directory. Default: /tmp/codey-pack-target
+  CARGO_TARGET_DIR     Cargo target directory. Default: a unique temp directory per run
 EOF
 }
 
@@ -85,6 +86,21 @@ stop_conflicting_builds() {
       done
 }
 
+run_cargo_build() {
+  if [[ ${#BUILD_ARGS[@]} -gt 0 ]]; then
+    CARGO_TARGET_DIR="$TARGET_DIR" cargo build \
+      --manifest-path "$WORKSPACE_CARGO_TOML" \
+      -p codex-cli \
+      --bin codex \
+      "${BUILD_ARGS[@]}"
+  else
+    CARGO_TARGET_DIR="$TARGET_DIR" cargo build \
+      --manifest-path "$WORKSPACE_CARGO_TOML" \
+      -p codex-cli \
+      --bin codex
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --install)
@@ -124,6 +140,11 @@ if [[ -z "$VERSION" ]]; then
   exit 1
 fi
 
+if [[ -z "$TARGET_DIR" ]]; then
+  TARGET_DIR="$(mktemp -d "${TMPDIR:-/tmp}/codey-pack-target.XXXXXX")"
+  TARGET_DIR_WAS_DEFAULT=1
+fi
+
 TARGET_TRIPLE="$(detect_target_triple)"
 PROFILE_DIR="debug"
 BUILD_ARGS=()
@@ -138,6 +159,9 @@ PACKAGE_JSON_PATH="$STAGE_DIR/package.json"
 
 cleanup() {
   rm -rf "$STAGE_DIR"
+  if [[ $TARGET_DIR_WAS_DEFAULT -eq 1 ]]; then
+    rm -rf "$TARGET_DIR"
+  fi
 }
 trap cleanup EXIT
 
@@ -150,17 +174,11 @@ mkdir -p \
 stop_conflicting_builds
 
 echo "Building codex-cli (${PROFILE_DIR}) into $TARGET_DIR ..."
-if [[ ${#BUILD_ARGS[@]} -gt 0 ]]; then
-  CARGO_TARGET_DIR="$TARGET_DIR" cargo build \
-    --manifest-path "$WORKSPACE_CARGO_TOML" \
-    -p codex-cli \
-    --bin codex \
-    "${BUILD_ARGS[@]}"
-else
-  CARGO_TARGET_DIR="$TARGET_DIR" cargo build \
-    --manifest-path "$WORKSPACE_CARGO_TOML" \
-    -p codex-cli \
-    --bin codex
+if ! run_cargo_build; then
+  echo "Initial build failed. Clearing $TARGET_DIR and retrying once ..."
+  rm -rf "$TARGET_DIR"
+  mkdir -p "$TARGET_DIR"
+  run_cargo_build
 fi
 
 BINARY_PATH="$TARGET_DIR/$PROFILE_DIR/codex"

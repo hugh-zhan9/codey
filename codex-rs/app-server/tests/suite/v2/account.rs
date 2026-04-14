@@ -55,7 +55,9 @@ use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
-const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+// Account tests spin up fresh app-server processes repeatedly, which can take
+// longer on slower Bazel macOS runners once the suite is already warm.
+const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const LOGIN_ISSUER_ENV_VAR: &str = "CODEX_APP_SERVER_LOGIN_ISSUER";
 
 // Helper to create a minimal config.toml for the app server

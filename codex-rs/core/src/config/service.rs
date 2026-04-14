@@ -265,8 +265,7 @@ impl ConfigService {
         edits: Vec<(String, JsonValue, MergeStrategy)>,
     ) -> Result<ConfigWriteResponse, ConfigServiceError> {
         let allowed_path =
-            AbsolutePathBuf::resolve_path_against_base(CONFIG_TOML_FILE, &self.codex_home)
-                .map_err(|err| ConfigServiceError::io("failed to resolve user config path", err))?;
+            AbsolutePathBuf::resolve_path_against_base(CONFIG_TOML_FILE, &self.codex_home);
         let provided_path = match file_path {
             Some(path) => AbsolutePathBuf::from_absolute_path(PathBuf::from(path))
                 .map_err(|err| ConfigServiceError::io("failed to resolve user config path", err))?,
@@ -630,14 +629,7 @@ fn validate_config(value: &TomlValue) -> Result<(), toml::de::Error> {
 }
 
 fn paths_match(expected: impl AsRef<Path>, provided: impl AsRef<Path>) -> bool {
-    if let (Ok(expanded_expected), Ok(expanded_provided)) = (
-        path_utils::normalize_for_path_comparison(&expected),
-        path_utils::normalize_for_path_comparison(&provided),
-    ) {
-        expanded_expected == expanded_provided
-    } else {
-        expected.as_ref() == provided.as_ref()
-    }
+    path_utils::paths_match_after_normalization(expected, provided)
 }
 
 fn value_at_path<'a>(root: &'a TomlValue, segments: &[String]) -> Option<&'a TomlValue> {

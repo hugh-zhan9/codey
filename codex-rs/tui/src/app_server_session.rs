@@ -1,4 +1,5 @@
 use crate::bottom_pane::FeedbackAudience;
+use crate::legacy_core;
 use crate::status::StatusAccountDisplay;
 use crate::status::plan_type_display_name;
 use codex_app_server_client::AppServerClient;
@@ -64,7 +65,6 @@ use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnSteerParams;
 use codex_app_server_protocol::TurnSteerResponse;
 use codex_core::config::Config;
-use codex_core::message_history;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ModelAvailabilityNux;
@@ -298,6 +298,21 @@ impl AppServerSession {
         })
     }
 
+    pub(crate) async fn read_account(&mut self) -> Result<Option<Account>> {
+        let request_id = self.next_request_id();
+        let response: GetAccountResponse = self
+            .client
+            .request_typed(ClientRequest::GetAccount {
+                request_id,
+                params: GetAccountParams {
+                    refresh_token: false,
+                },
+            })
+            .await
+            .wrap_err("account/read failed")?;
+        Ok(response.account)
+    }
+
     pub(crate) async fn next_event(&mut self) -> Option<AppServerEvent> {
         self.client.next_event().await
     }
@@ -441,6 +456,7 @@ impl AppServerSession {
                 params: TurnStartParams {
                     thread_id: thread_id.to_string(),
                     input: items.into_iter().map(Into::into).collect(),
+                    responsesapi_client_metadata: None,
                     cwd: Some(cwd),
                     approval_policy: Some(approval_policy.into()),
                     approvals_reviewer: Some(approvals_reviewer.into()),
@@ -455,7 +471,7 @@ impl AppServerSession {
                 },
             })
             .await
-            .wrap_err("turn/start failed in TUI")
+            .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))
     }
 
     pub(crate) async fn turn_interrupt(
@@ -491,6 +507,7 @@ impl AppServerSession {
                 params: TurnSteerParams {
                     thread_id: thread_id.to_string(),
                     input: items.into_iter().map(Into::into).collect(),
+                    responsesapi_client_metadata: None,
                     expected_turn_id: turn_id,
                 },
             })
@@ -663,8 +680,18 @@ impl AppServerSession {
                 request_id,
                 params: ThreadRealtimeStartParams {
                     thread_id: thread_id.to_string(),
+                    output_modality: params.output_modality,
                     prompt: params.prompt,
                     session_id: params.session_id,
+                    transport: params.transport.map(|transport| match transport {
+                        codex_protocol::protocol::ConversationStartTransport::Websocket => {
+                            codex_app_server_protocol::ThreadRealtimeStartTransport::Websocket
+                        }
+                        codex_protocol::protocol::ConversationStartTransport::Webrtc { sdp } => {
+                            codex_app_server_protocol::ThreadRealtimeStartTransport::Webrtc { sdp }
+                        }
+                    }),
+                    voice: params.voice,
                 },
             })
             .await
@@ -829,6 +856,7 @@ fn model_preset_from_api_model(model: ApiModel) -> ModelPreset {
             })
             .collect(),
         supports_personality: model.supports_personality,
+        additional_speed_tiers: Vec::new(),
         is_default: model.is_default,
         upgrade,
         show_in_picker: !model.hidden,
@@ -1096,7 +1124,7 @@ async fn thread_session_state_from_thread_response(
         .map(ThreadId::from_string)
         .transpose()
         .map_err(|err| format!("forked_from_id is invalid: {err}"))?;
-    let (history_log_id, history_entry_count) = message_history::history_metadata(config).await;
+    let (history_log_id, history_entry_count) = legacy_core::message_history_metadata(config).await;
     let history_entry_count = u64::try_from(history_entry_count).unwrap_or(u64::MAX);
 
     Ok(ThreadSessionState {
@@ -1336,10 +1364,10 @@ mod tests {
         let config = build_config(&temp_dir).await;
         let thread_id = ThreadId::new();
 
-        message_history::append_entry("older", &thread_id, &config)
+        legacy_core::append_message_history_entry("older", &thread_id, &config)
             .await
             .expect("history append should succeed");
-        message_history::append_entry("newer", &thread_id, &config)
+        legacy_core::append_message_history_entry("newer", &thread_id, &config)
             .await
             .expect("history append should succeed");
 
@@ -1418,5 +1446,26 @@ mod tests {
                 plan: Some(ref plan),
             }) if plan == "Business"
         ));
+    }
+
+    #[test]
+    fn turn_start_errors_surface_server_message_without_tui_wrapper() {
+        let err = TypedRequestError::Server {
+            method: "turn/start".to_string(),
+            source: JSONRPCErrorError {
+                code: -32602,
+                message:
+                    "Current account is exhausted or invalid, and no backup account is available."
+                        .to_string(),
+                data: None,
+            },
+        };
+
+        let report = color_eyre::eyre::eyre!(err.to_string());
+
+        assert_eq!(
+            report.to_string(),
+            "turn/start: Current account is exhausted or invalid, and no backup account is available."
+        );
     }
 }

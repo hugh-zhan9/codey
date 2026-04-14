@@ -31,13 +31,16 @@ async fn agents_instructions(mut builder: TestCodexBuilder) -> Result<String> {
 async fn agents_override_is_preferred_over_agents_md() -> Result<()> {
     let instructions =
         agents_instructions(test_codex().with_workspace_setup(|cwd, fs| async move {
-            let agents_md = cwd.join("AGENTS.md").expect("absolute AGENTS.md path");
-            let override_md = cwd
-                .join("AGENTS.override.md")
-                .expect("absolute AGENTS.override.md path");
-            fs.write_file(&agents_md, b"base doc".to_vec()).await?;
-            fs.write_file(&override_md, b"override doc".to_vec())
+            let agents_md = cwd.join("AGENTS.md");
+            let override_md = cwd.join("AGENTS.override.md");
+            fs.write_file(&agents_md, b"base doc".to_vec(), /*sandbox*/ None)
                 .await?;
+            fs.write_file(
+                &override_md,
+                b"override doc".to_vec(),
+                /*sandbox*/ None,
+            )
+            .await?;
             Ok::<(), anyhow::Error>(())
         }))
         .await?;
@@ -62,11 +65,16 @@ async fn configured_fallback_is_used_when_agents_candidate_is_directory() -> Res
                 config.project_doc_fallback_filenames = vec!["WORKFLOW.md".to_string()];
             })
             .with_workspace_setup(|cwd, fs| async move {
-                let agents_dir = cwd.join("AGENTS.md").expect("absolute AGENTS.md path");
-                let fallback = cwd.join("WORKFLOW.md").expect("absolute WORKFLOW.md path");
-                fs.create_directory(&agents_dir, CreateDirectoryOptions { recursive: true })
+                let agents_dir = cwd.join("AGENTS.md");
+                let fallback = cwd.join("WORKFLOW.md");
+                fs.create_directory(
+                    &agents_dir,
+                    CreateDirectoryOptions { recursive: true },
+                    /*sandbox*/ None,
+                )
+                .await?;
+                fs.write_file(&fallback, b"fallback doc".to_vec(), /*sandbox*/ None)
                     .await?;
-                fs.write_file(&fallback, b"fallback doc".to_vec()).await?;
                 Ok::<(), anyhow::Error>(())
             }),
     )
@@ -85,10 +93,7 @@ async fn agents_docs_are_concatenated_from_project_root_to_cwd() -> Result<()> {
     let instructions = agents_instructions(
         test_codex()
             .with_config(|config| {
-                config.cwd = config
-                    .cwd
-                    .join("nested/workspace")
-                    .expect("absolute nested workspace path");
+                config.cwd = config.cwd.join("nested/workspace");
             })
             .with_workspace_setup(|cwd, fs| async move {
                 let nested = cwd.clone();
@@ -96,20 +101,26 @@ async fn agents_docs_are_concatenated_from_project_root_to_cwd() -> Result<()> {
                     .parent()
                     .and_then(|parent| parent.parent())
                     .expect("nested workspace should have a project root ancestor");
-                let root_agents = root
-                    .join("AGENTS.md")
-                    .expect("absolute root AGENTS.md path");
-                let git_marker = root.join(".git").expect("absolute .git path");
-                let nested_agents = nested
-                    .join("AGENTS.md")
-                    .expect("absolute nested AGENTS.md path");
+                let root_agents = root.join("AGENTS.md");
+                let git_marker = root.join(".git");
+                let nested_agents = nested.join("AGENTS.md");
 
-                fs.create_directory(&nested, CreateDirectoryOptions { recursive: true })
+                fs.create_directory(
+                    &nested,
+                    CreateDirectoryOptions { recursive: true },
+                    /*sandbox*/ None,
+                )
+                .await?;
+                fs.write_file(&root_agents, b"root doc".to_vec(), /*sandbox*/ None)
                     .await?;
-                fs.write_file(&root_agents, b"root doc".to_vec()).await?;
-                fs.write_file(&git_marker, b"gitdir: /tmp/mock-git-dir\n".to_vec())
+                fs.write_file(
+                    &git_marker,
+                    b"gitdir: /tmp/mock-git-dir\n".to_vec(),
+                    /*sandbox*/ None,
+                )
+                .await?;
+                fs.write_file(&nested_agents, b"child doc".to_vec(), /*sandbox*/ None)
                     .await?;
-                fs.write_file(&nested_agents, b"child doc".to_vec()).await?;
                 Ok::<(), anyhow::Error>(())
             }),
     )
